@@ -77,6 +77,13 @@ enum rpc_cmd {
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_MEMSET_TENSOR,
+    RPC_CMD_SUPPORTS_OP,
+    RPC_CMD_KVARN_TAIL_ATTENTION_SUPPORTED,
+    RPC_CMD_KVARN_OPS,
+    RPC_CMD_KVARN_NATIVE_OPS,
+    RPC_CMD_KVARN_NATIVE_ORIGINAL_V,
+    RPC_CMD_KVARN_MIXED_TAIL_NATIVE_PREFERRED,
+    RPC_CMD_KVARN_NATIVE_ROTATED_MAX_QUERY_TOKENS,
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -202,6 +209,52 @@ struct rpc_msg_get_device_memory_rsp {
 
 struct rpc_msg_graph_recompute_req {
     uint32_t device;
+};
+
+struct rpc_msg_supports_op_req {
+    uint32_t device;
+    rpc_tensor op;
+    rpc_tensor srcs[GGML_MAX_SRC];
+};
+
+struct rpc_msg_supports_op_rsp {
+    uint8_t result;
+};
+
+struct rpc_msg_kvarn_tail_attention_supported_req {
+    uint32_t device;
+    uint32_t body_k;
+    uint32_t body_v;
+    uint32_t tail_k;
+    uint32_t tail_v;
+    int64_t  d_k;
+    int64_t  d_v;
+};
+
+struct rpc_msg_kvarn_tail_attention_supported_rsp {
+    uint8_t result;
+};
+
+// Shared wire format for the legacy KVarN backend procs that return a boolean
+// from a single device argument. `present` distinguishes "backend has the proc"
+// from the boolean result, so callers can preserve default-on semantics (e.g.
+// mixed_tail_native_preferred returns true when the proc is absent).
+struct rpc_msg_kvarn_proc_bool_req {
+    uint32_t device;
+};
+
+struct rpc_msg_kvarn_proc_bool_rsp {
+    uint8_t present;
+    uint8_t result;
+};
+
+struct rpc_msg_kvarn_proc_u32_req {
+    uint32_t device;
+};
+
+struct rpc_msg_kvarn_proc_u32_rsp {
+    uint8_t  present;
+    uint32_t result;
 };
 
 #pragma pack(pop)
@@ -1146,6 +1199,13 @@ public:
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
+    bool supports_op(const rpc_msg_supports_op_req & request, rpc_msg_supports_op_rsp & response);
+    bool kvarn_tail_attention_supported(const rpc_msg_kvarn_tail_attention_supported_req & request, rpc_msg_kvarn_tail_attention_supported_rsp & response);
+    bool kvarn_ops(const rpc_msg_kvarn_proc_bool_req & request, rpc_msg_kvarn_proc_bool_rsp & response);
+    bool kvarn_native_ops(const rpc_msg_kvarn_proc_bool_req & request, rpc_msg_kvarn_proc_bool_rsp & response);
+    bool kvarn_native_original_v(const rpc_msg_kvarn_proc_bool_req & request, rpc_msg_kvarn_proc_bool_rsp & response);
+    bool kvarn_mixed_tail_native_preferred(const rpc_msg_kvarn_proc_bool_req & request, rpc_msg_kvarn_proc_bool_rsp & response);
+    bool kvarn_native_rotated_max_query_tokens(const rpc_msg_kvarn_proc_u32_req & request, rpc_msg_kvarn_proc_u32_rsp & response);
 
     struct stored_graph {
         std::vector<uint8_t>   buffer;
@@ -1775,6 +1835,127 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
     return true;
 }
 
+static ggml_backend_dev_t rpc_server_device(const std::vector<ggml_backend_t> & backends, uint32_t dev_id) {
+    if (dev_id >= backends.size()) {
+        return nullptr;
+    }
+    return ggml_backend_get_device(backends[dev_id]);
+}
+
+bool rpc_server::supports_op(const rpc_msg_supports_op_req & request, rpc_msg_supports_op_rsp & response) {
+    response.result = 0;
+    ggml_backend_dev_t dev = rpc_server_device(backends, request.device);
+    if (!dev) {
+        return false;
+    }
+
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead()*(1 + GGML_MAX_SRC),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+
+    ggml_tensor * op = deserialize_tensor(ctx, &request.op);
+    if (op == nullptr) {
+        GGML_LOG_ERROR("Null tensor pointer passed to server supports_op function.\n");
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (request.srcs[i].id != 0) {
+            op->src[i] = deserialize_tensor(ctx, &request.srcs[i]);
+        }
+    }
+
+    response.result = ggml_backend_dev_supports_op(dev, op) ? 1 : 0;
+    return true;
+}
+
+bool rpc_server::kvarn_tail_attention_supported(const rpc_msg_kvarn_tail_attention_supported_req & request, rpc_msg_kvarn_tail_attention_supported_rsp & response) {
+    response.result = 0;
+    ggml_backend_dev_t dev = rpc_server_device(backends, request.device);
+    if (!dev) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    using backend_kvarn_tail_attention_supported_t = bool (*)(
+            ggml_backend_dev_t, ggml_type, ggml_type, ggml_type, ggml_type, int64_t, int64_t);
+    auto * fn = reg ? reinterpret_cast<backend_kvarn_tail_attention_supported_t>(
+            ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_kvarn_tail_attention_supported")) : nullptr;
+    if (fn == nullptr) {
+        return true;
+    }
+    response.result = fn(dev, (ggml_type) request.body_k, (ggml_type) request.body_v,
+            (ggml_type) request.tail_k, (ggml_type) request.tail_v,
+            request.d_k, request.d_v) ? 1 : 0;
+    return true;
+}
+
+// Resolves a legacy single-device KVarN backend proc (bool return) and fills
+// `present` + `result`. Absence of the proc is reported (not an error) so the
+// client can reproduce default-on semantics where applicable.
+static bool rpc_server_kvarn_bool_proc(
+        const std::vector<ggml_backend_t> & backends,
+        const rpc_msg_kvarn_proc_bool_req & request,
+        rpc_msg_kvarn_proc_bool_rsp & response,
+        const char * name) {
+    response.present = 0;
+    response.result = 0;
+    ggml_backend_dev_t dev = rpc_server_device(backends, request.device);
+    if (!dev) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    using backend_kvarn_bool_t = bool (*)(ggml_backend_dev_t);
+    auto * fn = reg ? reinterpret_cast<backend_kvarn_bool_t>(
+            ggml_backend_reg_get_proc_address(reg, name)) : nullptr;
+    if (fn == nullptr) {
+        return true;
+    }
+    response.present = 1;
+    response.result = fn(dev) ? 1 : 0;
+    return true;
+}
+
+bool rpc_server::kvarn_ops(const rpc_msg_kvarn_proc_bool_req & request, rpc_msg_kvarn_proc_bool_rsp & response) {
+    return rpc_server_kvarn_bool_proc(backends, request, response, "ggml_backend_kvarn_ops");
+}
+
+bool rpc_server::kvarn_native_ops(const rpc_msg_kvarn_proc_bool_req & request, rpc_msg_kvarn_proc_bool_rsp & response) {
+    return rpc_server_kvarn_bool_proc(backends, request, response, "ggml_backend_kvarn_native_ops");
+}
+
+bool rpc_server::kvarn_native_original_v(const rpc_msg_kvarn_proc_bool_req & request, rpc_msg_kvarn_proc_bool_rsp & response) {
+    return rpc_server_kvarn_bool_proc(backends, request, response, "ggml_backend_kvarn_native_original_v");
+}
+
+bool rpc_server::kvarn_mixed_tail_native_preferred(const rpc_msg_kvarn_proc_bool_req & request, rpc_msg_kvarn_proc_bool_rsp & response) {
+    return rpc_server_kvarn_bool_proc(backends, request, response, "ggml_backend_kvarn_mixed_tail_native_preferred");
+}
+
+bool rpc_server::kvarn_native_rotated_max_query_tokens(const rpc_msg_kvarn_proc_u32_req & request, rpc_msg_kvarn_proc_u32_rsp & response) {
+    response.present = 0;
+    response.result = 0;
+    ggml_backend_dev_t dev = rpc_server_device(backends, request.device);
+    if (!dev) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    using backend_kvarn_u32_t = uint32_t (*)(ggml_backend_dev_t);
+    auto * fn = reg ? reinterpret_cast<backend_kvarn_u32_t>(
+            ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_kvarn_native_rotated_max_query_tokens")) : nullptr;
+    if (fn == nullptr) {
+        return true;
+    }
+    response.present = 1;
+    response.result = fn(dev);
+    return true;
+}
+
 rpc_server::~rpc_server() {
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
@@ -2041,6 +2222,104 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_SUPPORTS_OP: {
+                rpc_msg_supports_op_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_supports_op_rsp response;
+                if (!server.supports_op(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_KVARN_TAIL_ATTENTION_SUPPORTED: {
+                rpc_msg_kvarn_tail_attention_supported_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_kvarn_tail_attention_supported_rsp response;
+                if (!server.kvarn_tail_attention_supported(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_KVARN_OPS: {
+                rpc_msg_kvarn_proc_bool_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_kvarn_proc_bool_rsp response;
+                if (!server.kvarn_ops(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_KVARN_NATIVE_OPS: {
+                rpc_msg_kvarn_proc_bool_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_kvarn_proc_bool_rsp response;
+                if (!server.kvarn_native_ops(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_KVARN_NATIVE_ORIGINAL_V: {
+                rpc_msg_kvarn_proc_bool_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_kvarn_proc_bool_rsp response;
+                if (!server.kvarn_native_original_v(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_KVARN_MIXED_TAIL_NATIVE_PREFERRED: {
+                rpc_msg_kvarn_proc_bool_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_kvarn_proc_bool_rsp response;
+                if (!server.kvarn_mixed_tail_native_preferred(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_KVARN_NATIVE_ROTATED_MAX_QUERY_TOKENS: {
+                rpc_msg_kvarn_proc_u32_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_kvarn_proc_u32_rsp response;
+                if (!server.kvarn_native_rotated_max_query_tokens(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             default: {
                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
                 return;
@@ -2178,10 +2457,21 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 }
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    GGML_UNUSED(dev);
-    GGML_UNUSED(op);
-    //TODO: call the remote backend and cache the results
-    return true;
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+
+    rpc_msg_supports_op_req request = {
+        /* .device = */ ctx->device,
+        /* .op     = */ serialize_tensor(op),
+        /* .srcs   = */ {},
+    };
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        request.srcs[i] = serialize_tensor(op->src[i]);
+    }
+    auto dispatcher = get_dispatcher(ctx->endpoint);
+    auto input = std::shared_ptr<const void>(&request, [](const void *) {});
+    rpc_msg_supports_op_rsp response;
+    dispatcher->send(RPC_CMD_SUPPORTS_OP, input, sizeof(request), &response, sizeof(response));
+    return response.result != 0;
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
@@ -2256,12 +2546,94 @@ static ggml_backend_dev_t ggml_backend_rpc_reg_get_device(ggml_backend_reg_t reg
     }
 }
 
+static bool ggml_backend_rpc_kvarn_tail_attention_supported(
+        ggml_backend_dev_t dev,
+        ggml_type body_k, ggml_type body_v,
+        ggml_type tail_k, ggml_type tail_v,
+        int64_t d_k, int64_t d_v) {
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+
+    rpc_msg_kvarn_tail_attention_supported_req request = {
+        /* .device = */ ctx->device,
+        /* .body_k = */ body_k,
+        /* .body_v = */ body_v,
+        /* .tail_k = */ tail_k,
+        /* .tail_v = */ tail_v,
+        /* .d_k    = */ d_k,
+        /* .d_v    = */ d_v,
+    };
+    auto dispatcher = get_dispatcher(ctx->endpoint);
+    auto input = std::shared_ptr<const void>(&request, [](const void *) {});
+    rpc_msg_kvarn_tail_attention_supported_rsp response;
+    dispatcher->send(RPC_CMD_KVARN_TAIL_ATTENTION_SUPPORTED,
+            input, sizeof(request), &response, sizeof(response));
+    return response.result != 0;
+}
+
+// Legacy single-device KVarN bool procs. `default_true` reproduces the
+// default-on semantics used when the proc is absent on the backend (e.g.
+// mixed_tail_native_preferred).
+static bool rpc_kvarn_bool_proc(ggml_backend_dev_t dev, enum rpc_cmd cmd, bool default_true) {
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+    rpc_msg_kvarn_proc_bool_req request = { /* .device = */ ctx->device };
+    auto dispatcher = get_dispatcher(ctx->endpoint);
+    auto input = std::shared_ptr<const void>(&request, [](const void *) {});
+    rpc_msg_kvarn_proc_bool_rsp response;
+    dispatcher->send(cmd, input, sizeof(request), &response, sizeof(response));
+    return response.present ? response.result != 0 : default_true;
+}
+
+static bool ggml_backend_rpc_kvarn_ops(ggml_backend_dev_t dev) {
+    return rpc_kvarn_bool_proc(dev, RPC_CMD_KVARN_OPS, false);
+}
+
+static bool ggml_backend_rpc_kvarn_native_ops(ggml_backend_dev_t dev) {
+    return rpc_kvarn_bool_proc(dev, RPC_CMD_KVARN_NATIVE_OPS, false);
+}
+
+static bool ggml_backend_rpc_kvarn_native_original_v(ggml_backend_dev_t dev) {
+    return rpc_kvarn_bool_proc(dev, RPC_CMD_KVARN_NATIVE_ORIGINAL_V, false);
+}
+
+static bool ggml_backend_rpc_kvarn_mixed_tail_native_preferred(ggml_backend_dev_t dev) {
+    return rpc_kvarn_bool_proc(dev, RPC_CMD_KVARN_MIXED_TAIL_NATIVE_PREFERRED, true);
+}
+
+static uint32_t ggml_backend_rpc_kvarn_native_rotated_max_query_tokens(ggml_backend_dev_t dev) {
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+    rpc_msg_kvarn_proc_u32_req request = { /* .device = */ ctx->device };
+    auto dispatcher = get_dispatcher(ctx->endpoint);
+    auto input = std::shared_ptr<const void>(&request, [](const void *) {});
+    rpc_msg_kvarn_proc_u32_rsp response;
+    dispatcher->send(RPC_CMD_KVARN_NATIVE_ROTATED_MAX_QUERY_TOKENS,
+            input, sizeof(request), &response, sizeof(response));
+    return response.present ? response.result : 0;
+}
+
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (std::strcmp(name, "ggml_backend_rpc_add_server") == 0) {
         return (void *)ggml_backend_rpc_add_server;
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
+    }
+    if (std::strcmp(name, "ggml_backend_kvarn_tail_attention_supported") == 0) {
+        return (void *)ggml_backend_rpc_kvarn_tail_attention_supported;
+    }
+    if (std::strcmp(name, "ggml_backend_kvarn_ops") == 0) {
+        return (void *)ggml_backend_rpc_kvarn_ops;
+    }
+    if (std::strcmp(name, "ggml_backend_kvarn_native_ops") == 0) {
+        return (void *)ggml_backend_rpc_kvarn_native_ops;
+    }
+    if (std::strcmp(name, "ggml_backend_kvarn_native_original_v") == 0) {
+        return (void *)ggml_backend_rpc_kvarn_native_original_v;
+    }
+    if (std::strcmp(name, "ggml_backend_kvarn_mixed_tail_native_preferred") == 0) {
+        return (void *)ggml_backend_rpc_kvarn_mixed_tail_native_preferred;
+    }
+    if (std::strcmp(name, "ggml_backend_kvarn_native_rotated_max_query_tokens") == 0) {
+        return (void *)ggml_backend_rpc_kvarn_native_rotated_max_query_tokens;
     }
     return NULL;
 
