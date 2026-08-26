@@ -489,6 +489,22 @@ native; unsupported shapes or source layouts fail closed or use the explicit
 device materialization fallback instead of ignoring current rows or relying on
 an accidental scheduler fallback.
 
+The ggml RPC backend is a graph pass-through, so KVarN and precision-tail graphs
+execute on the remote backend directly. Bee forwards capability probes to the
+server: `ggml_backend_dev_supports_op` and the legacy single-device KVarN procs
+(`kvarn_ops`, `kvarn_native_ops`, `kvarn_native_original_v`,
+`kvarn_mixed_tail_native_preferred`, `kvarn_native_rotated_max_query_tokens`)
+plus `ggml_backend_kvarn_tail_attention_supported` are round-tripped over new
+RPC commands. This lets the client select native KVarN store/view/materialize
+and native-exact routes based on the remote device's real capabilities instead
+of assuming unsupported operations. The RPC backend deliberately does not
+advertise the newer `ggml_backend_kvarn_capabilities` extension: advertising it
+would preempt the legacy fallback that every KVarN backend (CUDA, Vulkan, CPU)
+provides. The legacy dev-less `ggml_backend_kv_tail_*` procs are not forwardable
+over RPC, so the standard-KV precision tail uses its generic route (still
+functional, not fused native tail attention). Protocol patch version was bumped
+to signal the new commands; clients and servers must be updated together.
+
 ### July 2026 compact-tail correction
 
 The completion run used Gemma 4 31B Q5_K_S at context 16384, `-b 2048
