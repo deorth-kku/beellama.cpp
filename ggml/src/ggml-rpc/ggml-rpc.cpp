@@ -2456,8 +2456,76 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
     GGML_UNUSED(dev);
 }
 
+// The scheduler probes supports_op for nearly every node of every allocated
+// graph (once per ubatch). Without caching, each probe is a TCP round trip to
+// the remote server, which by itself halves prefill throughput for long
+// contexts. The answer is stable for a given (endpoint, device, op, dst type,
+// src types/nulls) signature, so cache it process-wide (the old stub had the
+// same TODO: "call the remote backend and cache the results"). The endpoint is
+// part of the key because the device index is only unique within one
+// endpoint: two servers that both expose "device 0" may back different
+// hardware and answer differently.
+// Shapes (ne/nb) are deliberately NOT part of the key: every backend
+// supports_op implementation in this tree keys on (op, dst type, src types)
+// only, and including the token-count dims would defeat the cache, since the
+// same op is re-probed with a fresh shape every ubatch. If a shape-dependent
+// supports_op ever appears, the key must be widened.
+struct rpc_supports_op_key {
+    std::string endpoint;
+    uint32_t device;
+    uint32_t op;
+    uint32_t type;
+    uint32_t srcs[GGML_MAX_SRC];
+
+    bool operator==(const rpc_supports_op_key & other) const {
+        return endpoint == other.endpoint && device == other.device &&
+               op == other.op && type == other.type &&
+               std::equal(srcs, srcs + GGML_MAX_SRC, other.srcs);
+    }
+};
+
+struct rpc_supports_op_key_hash {
+    size_t operator()(const rpc_supports_op_key & key) const {
+        // FNV-1a
+        size_t h = 14695981039346656037ULL;
+        auto mix = [&h](uint32_t v) { h ^= v; h *= 1099511628211ULL; };
+        for (const unsigned char c : key.endpoint) {
+            mix(c);
+        }
+        mix(key.device);
+        mix(key.op);
+        mix(key.type);
+        for (uint32_t i = 0; i < GGML_MAX_SRC; i++) {
+            mix(key.srcs[i]);
+        }
+        return h;
+    }
+};
+
+static std::mutex g_rpc_supports_op_cache_mutex;
+static std::unordered_map<rpc_supports_op_key, bool, rpc_supports_op_key_hash> g_rpc_supports_op_cache;
+
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+
+    rpc_supports_op_key key;
+    key.endpoint = ctx->endpoint;
+    key.device   = ctx->device;
+    key.op       = (uint32_t) op->op;
+    key.type     = (uint32_t) op->type;
+    // encode src types as type+1 so a null src (0) cannot collide with
+    // GGML_TYPE_F32 (type 0)
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        key.srcs[i] = op->src[i] ? (uint32_t) op->src[i]->type + 1u : 0;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_rpc_supports_op_cache_mutex);
+        auto it = g_rpc_supports_op_cache.find(key);
+        if (it != g_rpc_supports_op_cache.end()) {
+            return it->second;
+        }
+    }
 
     rpc_msg_supports_op_req request = {
         /* .device = */ ctx->device,
@@ -2471,7 +2539,12 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
     auto input = std::shared_ptr<const void>(&request, [](const void *) {});
     rpc_msg_supports_op_rsp response;
     dispatcher->send(RPC_CMD_SUPPORTS_OP, input, sizeof(request), &response, sizeof(response));
-    return response.result != 0;
+    const bool result = response.result != 0;
+    {
+        std::lock_guard<std::mutex> lock(g_rpc_supports_op_cache_mutex);
+        g_rpc_supports_op_cache.emplace(key, result);
+    }
+    return result;
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
