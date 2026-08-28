@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cinttypes>
+#include <cstdio>
 #include <optional>
 #include <string>
 #include <vector>
@@ -21,6 +22,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <thread>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
@@ -92,6 +94,193 @@ static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
+
+// ===== RPC wire-traffic diagnostic (KVarN-over-RPC investigation) =====
+// Records per-name / per-endpoint set (client -> worker) and get (worker ->
+// client) byte counts, plus a per-transfer series of the two flows, and
+// prints a summary at process exit. Recording and printing are both enabled
+// only when GGML_RPC_DEBUG is set, so the hot path stays free otherwise.
+struct rpc_traffic_stat {
+    uint64_t set_count = 0;
+    uint64_t set_bytes = 0;
+    uint64_t get_count = 0;
+    uint64_t get_bytes = 0;
+};
+
+static std::mutex g_rpc_traffic_mutex;
+static std::unordered_map<std::string, rpc_traffic_stat> g_rpc_traffic_by_name;
+static std::unordered_map<std::string, rpc_traffic_stat> g_rpc_traffic_by_endpoint;
+// Per-transfer (not per-time) series: each recorded transfer advances the
+// bucket counter, so bucket b holds the bytes of transfers number
+// [b * N/64, (b+1) * N/64) of the run's total transfer count.
+static std::vector<int64_t> g_rpc_traffic_ts_set; // set bytes per transfer bucket
+static std::vector<int64_t> g_rpc_traffic_ts_get; // get bytes per transfer bucket
+static uint64_t g_rpc_traffic_ts_next = 0;
+static bool g_rpc_traffic_series_ready = false;
+static std::chrono::steady_clock::time_point g_rpc_traffic_last_print{};
+static bool g_rpc_traffic_last_print_valid = false;
+
+static int g_rpc_traffic_n_buckets() { return 64; }
+
+// Compact in-run summary. IMPORTANT: the full summary at atexit is usually
+// lost, because common_log (llama-common) is an async queue + worker thread
+// whose singleton is intentionally leaked (never destructed), so at process
+// exit nothing drains the queue before the worker thread is killed. Printing
+// periodically during the run guarantees the data reaches the log file.
+// Caller must hold g_rpc_traffic_mutex.
+static void g_rpc_traffic_print_periodic_locked(void);
+
+static void g_rpc_traffic_init_series() {
+    if (g_rpc_traffic_series_ready) return;
+    g_rpc_traffic_series_ready = true;
+    int nb = g_rpc_traffic_n_buckets();
+    g_rpc_traffic_ts_set.assign(nb, 0);
+    g_rpc_traffic_ts_get.assign(nb, 0);
+}
+
+static void g_rpc_traffic_record(const char * name, const char * endpoint, bool is_set, size_t nbytes) {
+    if (nbytes == 0 || RPC_DEBUG == nullptr) return;
+    g_rpc_traffic_init_series();
+    {
+        std::lock_guard<std::mutex> l(g_rpc_traffic_mutex);
+        int b = (int)(g_rpc_traffic_ts_next % (uint64_t)g_rpc_traffic_n_buckets());
+        g_rpc_traffic_ts_next++;
+        if (is_set) {
+            g_rpc_traffic_ts_set[b] += (int64_t)nbytes;
+        } else {
+            g_rpc_traffic_ts_get[b] += (int64_t)nbytes;
+        }
+    }
+    if (name && name[0]) {
+        std::lock_guard<std::mutex> l(g_rpc_traffic_mutex);
+        rpc_traffic_stat & s = g_rpc_traffic_by_name[name];
+        if (is_set) { s.set_count++; s.set_bytes += nbytes; }
+        else        { s.get_count++; s.get_bytes += nbytes; }
+    }
+    if (endpoint && endpoint[0]) {
+        std::lock_guard<std::mutex> l(g_rpc_traffic_mutex);
+        rpc_traffic_stat & s = g_rpc_traffic_by_endpoint[endpoint];
+        if (is_set) { s.set_count++; s.set_bytes += nbytes; }
+        else        { s.get_count++; s.get_bytes += nbytes; }
+    }
+    // periodic in-run summary (every >= 2 s of wire activity)
+    {
+        std::lock_guard<std::mutex> l(g_rpc_traffic_mutex);
+        auto now = std::chrono::steady_clock::now();
+        if (!g_rpc_traffic_last_print_valid) {
+            g_rpc_traffic_last_print_valid = true;
+            g_rpc_traffic_last_print = now;
+        } else if (now - g_rpc_traffic_last_print >= std::chrono::seconds(2)) {
+            g_rpc_traffic_last_print = now;
+            g_rpc_traffic_print_periodic_locked();
+        }
+    }
+}
+
+static const char * g_rpc_fmt_size(uint64_t b) {
+    // per-thread buffers: the returned pointer is only valid until the next
+    // call from the same thread (at most two are live per log line)
+    static thread_local char bufs[3][16];
+    static thread_local int idx = 0;
+    idx = (idx + 1) % 3;
+    char *p = bufs[idx];
+    if (b >= (uint64_t)1024 * 1024 * 1024) snprintf(p, 16, "%u.Gb", (unsigned)(b / 1024 / 1024 / 1024));
+    else if (b >= (uint64_t)1024 * 1024)   snprintf(p, 16, "%u.Mb", (unsigned)(b / 1024 / 1024));
+    else if (b >= 1024)                    snprintf(p, 16, "%u.Kb", (unsigned)(b / 1024));
+    else                                   snprintf(p, 16, "%u.b",  (unsigned)b);
+    return p;
+}
+
+static void g_rpc_traffic_print_periodic_locked(void) {
+    uint64_t tset_bytes = 0, tget_bytes = 0;
+    for (auto &kv : g_rpc_traffic_by_name) {
+        tset_bytes += kv.second.set_bytes;
+        tget_bytes += kv.second.get_bytes;
+    }
+    GGML_LOG_DEBUG("[rpc-traffic] TOTAL set=%s get=%s ops=%" PRIu64 "\n",
+        g_rpc_fmt_size(tset_bytes), g_rpc_fmt_size(tget_bytes), g_rpc_traffic_ts_next);
+
+    std::vector<std::pair<std::string, rpc_traffic_stat>> ordered(g_rpc_traffic_by_name.begin(), g_rpc_traffic_by_name.end());
+    std::sort(ordered.begin(), ordered.end(), [](const auto &a, const auto &b) {
+        return (a.second.set_bytes + a.second.get_bytes) > (b.second.set_bytes + b.second.get_bytes);
+    });
+    for (size_t i = 0; i < ordered.size() && i < 10; i++) {
+        const rpc_traffic_stat &s = ordered[i].second;
+        GGML_LOG_DEBUG("[rpc-traffic]   %.40s set=%s(%" PRIu64 ") get=%s(%" PRIu64 ")\n",
+            ordered[i].first.c_str(),
+            g_rpc_fmt_size(s.set_bytes), s.set_bytes,
+            g_rpc_fmt_size(s.get_bytes), s.get_bytes);
+    }
+}
+
+static void g_rpc_traffic_print(void) {
+    std::lock_guard<std::mutex> l(g_rpc_traffic_mutex);
+
+    // Route through GGML_LOG_DEBUG so the summary lands in the same place as all
+    // other debug output (i.e. the --log-file when one is set), instead of stderr.
+    // ggml_log_internal caps each message at 127 bytes (buffer[128] in ggml.c), so
+    // keep every line short.
+
+    // Aggregate totals.
+    uint64_t tset_bytes = 0, tget_bytes = 0;
+    for (auto &kv : g_rpc_traffic_by_name) {
+        tset_bytes += kv.second.set_bytes;
+        tget_bytes += kv.second.get_bytes;
+    }
+    GGML_LOG_DEBUG("\n=== RPC wire-traffic summary (client side) ===\n");
+    GGML_LOG_DEBUG("TOTAL set=%s (%" PRIu64 ") get=%s (%" PRIu64 ")\n",
+        g_rpc_fmt_size(tset_bytes), tset_bytes, g_rpc_fmt_size(tget_bytes), tget_bytes);
+
+    // Transfer-series (trend across the run; one bucket per ~1/64 of the
+    // run's total transfer count, not a wall-clock interval).
+    GGML_LOG_DEBUG("--- series (64 transfer buckets) ---\n");
+    GGML_LOG_DEBUG("bucket set get set%% get\n");
+    for (int b = 0; b < g_rpc_traffic_n_buckets(); b++) {
+        double setp = (g_rpc_traffic_ts_set[b] + g_rpc_traffic_ts_get[b]) > 0
+            ? (double)g_rpc_traffic_ts_set[b] / (double)(g_rpc_traffic_ts_set[b] + g_rpc_traffic_ts_get[b]) * 100.0 : 0.0;
+        GGML_LOG_DEBUG("%d set=%s get=%s set%%=%.1f gc=%" PRId64 "\n",
+            b, g_rpc_fmt_size((uint64_t)g_rpc_traffic_ts_set[b]),
+                g_rpc_fmt_size((uint64_t)g_rpc_traffic_ts_get[b]), setp, g_rpc_traffic_ts_get[b]);
+    }
+
+    // Per-name breakdown (by total bytes, set+get).
+    GGML_LOG_DEBUG("\n--- per-name traffic (top 40 by bytes) ---\n");
+    GGML_LOG_DEBUG("name set_cnt set_bytes get_cnt get_bytes\n");
+    std::vector<std::pair<std::string, rpc_traffic_stat>> ordered(g_rpc_traffic_by_name.begin(), g_rpc_traffic_by_name.end());
+    std::sort(ordered.begin(), ordered.end(), [](const auto &a, const auto &b) {
+        return (a.second.set_bytes + a.second.get_bytes) > (b.second.set_bytes + b.second.get_bytes);
+    });
+    for (size_t i = 0; i < ordered.size() && i < 40; i++) {
+        const rpc_traffic_stat &s = ordered[i].second;
+        char nm[64];
+        snprintf(nm, sizeof(nm), "%.40s", ordered[i].first.c_str());
+        GGML_LOG_DEBUG("%.40s %7" PRIu64 " %11s %7" PRIu64 " %11s\n",
+            nm, s.set_count, g_rpc_fmt_size(s.set_bytes), s.get_count, g_rpc_fmt_size(s.get_bytes));
+    }
+
+    // Per-endpoint breakdown.
+    GGML_LOG_DEBUG("\n--- per-endpoint traffic ---\n");
+    for (auto &kv : g_rpc_traffic_by_endpoint) {
+        const rpc_traffic_stat &s = kv.second;
+        char ep[64];
+        snprintf(ep, sizeof(ep), "%.40s", kv.first.c_str());
+        GGML_LOG_DEBUG("%.40s %7" PRIu64 " %11s %7" PRIu64 " %11s\n",
+            ep, s.set_count, g_rpc_fmt_size(s.set_bytes), s.get_count, g_rpc_fmt_size(s.get_bytes));
+    }
+    GGML_LOG_DEBUG("\n");
+    // The log backend is an async queue whose worker thread is killed at
+    // process exit without draining (common_log singleton is intentionally
+    // leaked). Give it a moment to flush the summary to the log file.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+}
+
+static void g_rpc_traffic_register_exit(void) {
+    static bool registered = false;
+    if (!registered) {
+        registered = true;
+        std::atexit(g_rpc_traffic_print);
+    }
+}
 
 struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
@@ -293,6 +482,7 @@ struct ggml_backend_rpc_buffer_context {
     std::shared_ptr<rpc_dispatcher>   dispatcher;
     void                            * base_ptr;
     uint64_t                          remote_ptr;
+    std::string                       endpoint; // diagnostic: which RPC endpoint this buffer belongs to
 };
 
 // RPC helper functions
@@ -765,6 +955,8 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     memcpy(input, &rpc_tensor, sizeof(rpc_tensor));
     memcpy(input + sizeof(rpc_tensor), &offset, sizeof(offset));
     memcpy(input + sizeof(rpc_tensor) + sizeof(offset), data, size);
+    // wire-traffic diagnostic: data is actually on the wire here
+    g_rpc_traffic_record(tensor->name, ctx->endpoint.c_str(), /*is_set=*/true, size);
     std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
     ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input_ptr, input_size);
 }
@@ -776,6 +968,8 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     request->offset = offset;
     request->size = size;
     ctx->dispatcher->send(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size);
+    // wire-traffic diagnostic: 'size' bytes came back over the wire
+    g_rpc_traffic_record(tensor->name, ctx->endpoint.c_str(), /*is_set=*/false, size);
 }
 
 static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -838,7 +1032,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{dispatcher, nullptr, response.remote_ptr},
+            new ggml_backend_rpc_buffer_context{dispatcher, nullptr, response.remote_ptr, buft_ctx->endpoint},
             response.remote_size);
         return buffer;
     } else {
@@ -1148,6 +1342,8 @@ ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
         /* .device     = */ device,
         /* .name       = */ dev_name,
     };
+    // wire-traffic diagnostic: register the atexit summary once per client endpoint
+    g_rpc_traffic_register_exit();
     auto reg = ggml_backend_rpc_add_server(endpoint);
     ggml_backend_t backend = new ggml_backend {
         /* .guid    = */ ggml_backend_rpc_guid(),
@@ -1474,7 +1670,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
         return false;
     }
-    LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu\n", __func__, (void*)tensor->buffer, tensor->data, offset, size);
+    LOG_DBG("[%s] name: %s, buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu\n", __func__, tensor->name, (void*)tensor->buffer, tensor->data, offset, size);
 
     // sanitize tensor->data
     {
@@ -1614,7 +1810,7 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
         GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
         return false;
     }
-    LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %" PRIu64 "\n", __func__, (void*)tensor->buffer, tensor->data, request.offset, request.size);
+    LOG_DBG("[%s] name: %s, buffer: %p, data: %p, offset: %" PRIu64 ", size: %" PRIu64 "\n", __func__, tensor->name, (void*)tensor->buffer, tensor->data, request.offset, request.size);
 
     // sanitize tensor->data
     {
