@@ -809,6 +809,11 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         && strstr(tensor->name, "mask") != nullptr
         && (tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_F32)
         && tensor->ne[2] == 1
+        // mirror the worker's limits so values never truncate on the wire
+        // (a truncated n_rows/boundary fails the worker's checks and tears
+        // down the connection instead of falling back to the data path)
+        && tensor->ne[0] <= INT32_MAX
+        && (int64_t) tensor->ne[1] * tensor->ne[3] <= (int64_t) UINT32_MAX
         && tensor->nb[0] == (size_t) ggml_type_size(tensor->type)
         && tensor->nb[1] == tensor->nb[0] * tensor->ne[0]
         && tensor->nb[2] == tensor->nb[1] * tensor->ne[1]
@@ -1575,8 +1580,11 @@ bool rpc_server::fill_causal_mask(const std::vector<uint8_t> & input) {
         return false;
     }
     for (uint32_t i = 0; i < n_rows; i++) {
-        if (boundaries[i] < 0 || (uint64_t) boundaries[i] >= in_tensor->ne[0]) {
-            GGML_LOG_ERROR("[%s] boundary[%u]=%d out of range [0, %u)\n", __func__, i, boundaries[i], in_tensor->ne[0]);
+        // -1 is valid: it means the whole row is drop (-inf).
+        // Only check the upper bound when boundary >= 0; casting -1 to
+        // uint64_t would wrap to UINT64_MAX and incorrectly fail.
+        if (boundaries[i] < -1 || (boundaries[i] >= 0 && (uint64_t) boundaries[i] >= in_tensor->ne[0])) {
+            GGML_LOG_ERROR("[%s] boundary[%u]=%d out of range [-1, %u)\n", __func__, i, boundaries[i], in_tensor->ne[0]);
             return false;
         }
     }
@@ -1592,16 +1600,18 @@ bool rpc_server::fill_causal_mask(const std::vector<uint8_t> & input) {
         }
     }
 
-    // Refill the host-side bytes: row i = keep[0..b] + drop[b+1..n_kv-1]
+    // Refill the host-side bytes: row i = keep[0..b] + drop[b+1..n_kv-1].
+    // Must use std::fill, not memset: 0xFC00 / 0xFF800000 are multi-byte
+    // patterns; memset(0xFC) / memset(0xFF) would write 0xFCFC / 0xFFFFFFFF,
+    // i.e. NaN instead of -inf.
     std::vector<uint8_t> host(size, 0);
     if (in_tensor->type == GGML_TYPE_F16) {
         uint16_t * row = (uint16_t *) host.data();
         for (uint32_t i = 0; i < n_rows; i++) {
             const int64_t b = boundaries[i];
             const size_t keep_n = (size_t) (b + 1);
-            const size_t drop_n = (size_t) in_tensor->ne[0] - keep_n;
-            memset(row, 0x00, keep_n * sizeof(uint16_t)); // 0x0000 = +0.0
-            memset(row + keep_n, 0x00FC, drop_n * sizeof(uint16_t)); // 0xFC00 = -inf
+            std::fill(row, row + keep_n, uint16_t(0x0000)); // +0.0
+            std::fill(row + keep_n, row + in_tensor->ne[0], uint16_t(0xFC00)); // -inf
             row += in_tensor->ne[0];
         }
     } else {
@@ -1609,9 +1619,8 @@ bool rpc_server::fill_causal_mask(const std::vector<uint8_t> & input) {
         for (uint32_t i = 0; i < n_rows; i++) {
             const int64_t b = boundaries[i];
             const size_t keep_n = (size_t) (b + 1);
-            const size_t drop_n = (size_t) in_tensor->ne[0] - keep_n;
-            memset(row, 0x00, keep_n * sizeof(uint32_t)); // 0x00000000 = +0.0
-            memset(row + keep_n, 0x0080FF, drop_n * sizeof(uint32_t)); // 0xFF800000 = -inf
+            std::fill(row, row + keep_n, uint32_t(0x00000000)); // +0.0
+            std::fill(row + keep_n, row + in_tensor->ne[0], uint32_t(0xFF800000)); // -inf
             row += in_tensor->ne[0];
         }
     }
