@@ -82,6 +82,7 @@ enum rpc_cmd {
     RPC_CMD_KVARN_NATIVE_ORIGINAL_V,
     RPC_CMD_KVARN_MIXED_TAIL_NATIVE_PREFERRED,
     RPC_CMD_KVARN_NATIVE_ROTATED_MAX_QUERY_TOKENS,
+    RPC_CMD_FILL_CAUSAL_MASK,
     RPC_CMD_COUNT,
 };
 
@@ -112,6 +113,71 @@ static std::chrono::steady_clock::time_point g_rpc_traffic_last_print{};
 static bool g_rpc_traffic_last_print_valid = false;
 
 static int g_rpc_traffic_n_buckets() { return 64; }
+
+// ===== FILL_CAUSAL_MASK fast path (attn_inp_kq_mask over RPC) =====
+// The attention kq mask is, for pure-causal single-stream serving, a per-row
+// prefix: keep (0.0) for j <= boundary[i], drop (-inf) afterwards. Resending
+// the whole tensor over RPC grows as O(n_kv) per ubatch, i.e. O(n^2) over a
+// long prefill. Instead the client verifies the pattern locally and sends only
+// the per-row boundaries via RPC_CMD_FILL_CAUSAL_MASK; the worker refills the
+// identical bytes locally. Any deviation (SWA holes, empty cells, alibi,
+// multi-stream masks, ...) fails verification and falls back to the normal
+// data path, so this is a strict optimization with unchanged behavior.
+// Gated on the negotiated server protocol minor (>= 2) and on tensor size.
+static std::mutex g_rpc_proto_mutex;
+static std::unordered_map<std::string, uint8_t> g_rpc_proto_minor;
+
+static uint8_t rpc_proto_minor(const std::string & endpoint) {
+    std::lock_guard<std::mutex> l(g_rpc_proto_mutex);
+    auto it = g_rpc_proto_minor.find(endpoint);
+    return it != g_rpc_proto_minor.end() ? it->second : 0;
+}
+
+static bool rpc_mask_fill_disabled() {
+    static const bool disabled = []() {
+        const char * env = std::getenv("GGML_RPC_NO_MASK_FILL");
+        return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0;
+    }();
+    return disabled;
+}
+
+// Single-pass check that `data` is a row-major 2-D mask of pure causal
+// prefixes: every element is keep (0.0) or drop (-inf), and once a row turns
+// to drop it stays drop. On success fills `boundaries[i]` with the index of
+// the last keep element of row i (-1 if the row is all drop).
+static bool is_pure_causal_mask(const void * data, ggml_type type, int64_t n_kv, int64_t n_rows, std::vector<int32_t> & boundaries) {
+    boundaries.assign(n_rows, -1);
+    if (type == GGML_TYPE_F16) {
+        const uint16_t * p = (const uint16_t *) data;
+        for (int64_t i = 0; i < n_rows; i++) {
+            const uint16_t * row = p + i * n_kv;
+            int64_t b = -1;
+            bool dropped = false;
+            for (int64_t j = 0; j < n_kv; j++) {
+                if (row[j] == 0x0000) { if (dropped) return false; b = j; }
+                else if (row[j] == 0xFC00) { dropped = true; }
+                else return false;
+            }
+            boundaries[i] = (int32_t) b;
+        }
+    } else if (type == GGML_TYPE_F32) {
+        const uint32_t * p = (const uint32_t *) data;
+        for (int64_t i = 0; i < n_rows; i++) {
+            const uint32_t * row = p + i * n_kv;
+            int64_t b = -1;
+            bool dropped = false;
+            for (int64_t j = 0; j < n_kv; j++) {
+                if (row[j] == 0x00000000u) { if (dropped) return false; b = j; }
+                else if (row[j] == 0xFF800000u) { dropped = true; }
+                else return false;
+            }
+            boundaries[i] = (int32_t) b;
+        }
+    } else {
+        return false;
+    }
+    return true;
+}
 
 // Compact in-run summary. IMPORTANT: the full summary at atexit is usually
 // lost, because common_log (llama-common) is an async queue + worker thread
@@ -572,7 +638,8 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+// On success, *server_minor receives the negotiated server protocol minor.
+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t * server_minor) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
 
@@ -588,6 +655,9 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     }
 
     sock->update_caps(response.conn_caps);
+    if (server_minor) {
+        *server_minor = response.minor;
+    }
     return true;
 }
 
@@ -616,10 +686,15 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     if (sock == nullptr) {
         return nullptr;
     }
-    if (!negotiate_hello(sock)) {
+    uint8_t server_minor = 0;
+    if (!negotiate_hello(sock, &server_minor)) {
         return nullptr;
     }
-    LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
+    {
+        std::lock_guard<std::mutex> l(g_rpc_proto_mutex);
+        g_rpc_proto_minor[endpoint] = server_minor;
+    }
+    LOG_DBG("[%s] connected to %s (server proto %d.%d)\n", __func__, endpoint.c_str(), RPC_PROTO_MAJOR_VERSION, (int)server_minor);
     sockets[endpoint] = sock;
     return sock;
 }
@@ -723,6 +798,43 @@ static void ggml_backend_rpc_buffer_memset_tensor(
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
+    // Fast path: pure-causal attention masks are resent in full every ubatch
+    // (O(n_kv) per ubatch -> O(n^2) over a long prefill). If the data is
+    // verified locally to be a per-row 0/-inf prefix, send only the per-row
+    // boundaries and let the worker refill identical bytes locally.
+    if (offset == 0
+        && size == (size_t) ggml_nbytes(tensor)
+        && size >= 1024 * 1024
+        && tensor->name[0] != '\0'
+        && strstr(tensor->name, "mask") != nullptr
+        && (tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_F32)
+        && tensor->ne[2] == 1
+        && tensor->nb[0] == (size_t) ggml_type_size(tensor->type)
+        && tensor->nb[1] == tensor->nb[0] * tensor->ne[0]
+        && tensor->nb[2] == tensor->nb[1] * tensor->ne[1]
+        && !rpc_mask_fill_disabled()
+        && rpc_proto_minor(ctx->endpoint) >= 2) {
+        const int64_t n_kv   = tensor->ne[0];
+        const int64_t n_rows = tensor->ne[1] * tensor->ne[3];
+        std::vector<int32_t> boundaries;
+        if (is_pure_causal_mask(data, tensor->type, n_kv, n_rows, boundaries)) {
+            size_t payload_size = sizeof(rpc_tensor) + sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t) + (size_t) n_rows * sizeof(int32_t);
+            std::vector<uint8_t> payload(payload_size, 0);
+            memcpy(payload.data(), &rpc_tensor, sizeof(rpc_tensor));
+            memcpy(payload.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
+            memcpy(payload.data() + sizeof(rpc_tensor) + sizeof(offset), &size, sizeof(size));
+            uint32_t n_rows_u32 = (uint32_t) n_rows;
+            memcpy(payload.data() + sizeof(rpc_tensor) + sizeof(offset) + sizeof(size), &n_rows_u32, sizeof(n_rows_u32));
+            memcpy(payload.data() + sizeof(rpc_tensor) + sizeof(offset) + sizeof(size) + sizeof(uint32_t), boundaries.data(), (size_t) n_rows * sizeof(int32_t));
+            bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FILL_CAUSAL_MASK, payload.data(), payload.size());
+            RPC_STATUS_ASSERT(status);
+            // wire-traffic diagnostic: only the boundary payload went on the wire
+            g_rpc_traffic_record(tensor->name, ctx->endpoint.c_str(), /*is_set=*/true, payload.size());
+            return;
+        }
+        // not a pure causal prefix (SWA / empty cells / alibi / multi-stream) -
+        // fall through to the normal data path below, behavior unchanged
+    }
     if (size > HASH_THRESHOLD) {
         rpc_msg_set_tensor_hash_req request;
         request.tensor = rpc_tensor;
@@ -1102,6 +1214,7 @@ public:
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool memset_tensor(const rpc_msg_memset_tensor_req & request);
     bool set_tensor(const std::vector<uint8_t> & input);
+    bool fill_causal_mask(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -1411,6 +1524,98 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
     }
     ggml_backend_tensor_set(tensor, data, offset, size);
+    return true;
+}
+
+// Worker-side counterpart of the client's FILL_CAUSAL_MASK fast path.
+// Serialization format: | rpc_tensor | offset (8) | size (8) | n_rows (4) | boundaries (4 * n_rows) |
+// The client has already verified the mask is a pure per-row 0/-inf causal
+// prefix; refill the identical bytes locally and push them to the backend.
+bool rpc_server::fill_causal_mask(const std::vector<uint8_t> & input) {
+    if (input.size() < sizeof(rpc_tensor) + sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t)) {
+        return false;
+    }
+    const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
+    uint64_t offset = 0;
+    uint64_t size   = 0;
+    uint32_t n_rows = 0;
+    memcpy(&offset, input.data() + sizeof(rpc_tensor), sizeof(offset));
+    memcpy(&size,   input.data() + sizeof(rpc_tensor) + sizeof(offset), sizeof(size));
+    memcpy(&n_rows, input.data() + sizeof(rpc_tensor) + sizeof(offset) + sizeof(size), sizeof(n_rows));
+    if (input.size() < sizeof(rpc_tensor) + sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t) + (size_t)n_rows * sizeof(int32_t)) {
+        return false;
+    }
+    const int32_t * boundaries = (const int32_t *)(input.data() + sizeof(rpc_tensor) + sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t));
+
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * tensor = deserialize_tensor(ctx, in_tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+    LOG_DBG("[%s] name: %s, offset: %" PRIu64 ", size: %zu, n_rows: %u\n", __func__, tensor->name, offset, size, n_rows);
+
+    const size_t es = ggml_type_size((ggml_type) in_tensor->type);
+    if ((in_tensor->type != GGML_TYPE_F16 && in_tensor->type != GGML_TYPE_F32) || es == 0
+        || in_tensor->ne[2] != 1 || in_tensor->ne[0] == 0 || in_tensor->ne[0] > INT32_MAX
+        || (uint64_t) in_tensor->ne[0] * (uint64_t) in_tensor->ne[1] * es != size
+        || (uint64_t) in_tensor->ne[1] * (uint64_t) in_tensor->ne[3] != n_rows
+        || in_tensor->nb[0] != es || in_tensor->nb[1] != in_tensor->nb[0] * in_tensor->ne[0] || in_tensor->nb[2] != in_tensor->nb[1] * in_tensor->ne[1]) {
+        GGML_LOG_ERROR("[%s] tensor layout mismatch (type=%u, ne=[%u,%u,%u,%u], nb=[%u,%u,%u,%u], size=%zu, n_rows=%u)\n",
+                       __func__, in_tensor->type,
+                       in_tensor->ne[0], in_tensor->ne[1], in_tensor->ne[2], in_tensor->ne[3],
+                       in_tensor->nb[0], in_tensor->nb[1], in_tensor->nb[2], in_tensor->nb[3], size, n_rows);
+        return false;
+    }
+    for (uint32_t i = 0; i < n_rows; i++) {
+        if (boundaries[i] < 0 || (uint64_t) boundaries[i] >= in_tensor->ne[0]) {
+            GGML_LOG_ERROR("[%s] boundary[%u]=%d out of range [0, %u)\n", __func__, i, boundaries[i], in_tensor->ne[0]);
+            return false;
+        }
+    }
+
+    // sanitize tensor->data (same bounds check as set_tensor)
+    {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+        if (in_tensor->data + offset < p0 || in_tensor->data + offset >= p1 || size > (p1 - in_tensor->data - offset)) {
+            GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu) out of buffer bounds [0x%zx, 0x%zx)\n",
+                           __func__, in_tensor->data, offset, size, p0, p1);
+            return false;
+        }
+    }
+
+    // Refill the host-side bytes: row i = keep[0..b] + drop[b+1..n_kv-1]
+    std::vector<uint8_t> host(size, 0);
+    if (in_tensor->type == GGML_TYPE_F16) {
+        uint16_t * row = (uint16_t *) host.data();
+        for (uint32_t i = 0; i < n_rows; i++) {
+            const int64_t b = boundaries[i];
+            const size_t keep_n = (size_t) (b + 1);
+            const size_t drop_n = (size_t) in_tensor->ne[0] - keep_n;
+            memset(row, 0x00, keep_n * sizeof(uint16_t)); // 0x0000 = +0.0
+            memset(row + keep_n, 0x00FC, drop_n * sizeof(uint16_t)); // 0xFC00 = -inf
+            row += in_tensor->ne[0];
+        }
+    } else {
+        uint32_t * row = (uint32_t *) host.data();
+        for (uint32_t i = 0; i < n_rows; i++) {
+            const int64_t b = boundaries[i];
+            const size_t keep_n = (size_t) (b + 1);
+            const size_t drop_n = (size_t) in_tensor->ne[0] - keep_n;
+            memset(row, 0x00, keep_n * sizeof(uint32_t)); // 0x00000000 = +0.0
+            memset(row + keep_n, 0x0080FF, drop_n * sizeof(uint32_t)); // 0xFF800000 = -inf
+            row += in_tensor->ne[0];
+        }
+    }
+    ggml_backend_tensor_set(tensor, host.data(), offset, size);
     return true;
 }
 
@@ -2052,6 +2257,16 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.set_tensor(input)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_FILL_CAUSAL_MASK: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                if (!server.fill_causal_mask(input)) {
                     return;
                 }
                 break;
