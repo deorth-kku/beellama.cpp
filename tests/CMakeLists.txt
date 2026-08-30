@@ -289,6 +289,9 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+# FILL_CAUSAL_MASK fast-path verification (header-only helper in ggml-rpc)
+llama_build_and_test(test-rpc-mask.cpp)
+target_include_directories(test-rpc-mask PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc)
 llama_build_and_test(test-kv-stream-plan.cpp)
 target_include_directories(test-kv-stream-plan PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-kv-stream-config.cpp)
