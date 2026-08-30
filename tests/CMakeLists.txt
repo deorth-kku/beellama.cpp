@@ -351,6 +351,9 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
 llama_build_and_test(test-quantize-target.cpp  LABEL "main behavior backend"  LINK llama)
+# FILL_CAUSAL_MASK fast-path verification (header-only helper in ggml-rpc)
+llama_build_and_test(test-rpc-mask.cpp)
+target_include_directories(test-rpc-mask PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
