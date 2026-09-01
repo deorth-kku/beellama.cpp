@@ -416,7 +416,9 @@ std::vector<int64_t> llama_kvarn_compact_read_plan(
         const std::vector<uint32_t> & occupied_cells,
         const std::vector<uint32_t> & pending_cells,
         uint32_t capacity,
-        uint32_t padding) {
+        uint32_t padding,
+        uint32_t group_align,
+        uint32_t align_growth_percent) {
     if (capacity == 0 || padding == 0) {
         throw std::invalid_argument("invalid KVarN compact read-plan extent");
     }
@@ -425,18 +427,92 @@ std::vector<int64_t> llama_kvarn_compact_read_plan(
     cells.reserve(occupied_cells.size() + pending_cells.size());
     cells.insert(cells.end(), occupied_cells.begin(), occupied_cells.end());
     cells.insert(cells.end(), pending_cells.begin(), pending_cells.end());
-    std::set<uint32_t> seen;
+    // Отсев дубликатов по битовой карте вместо std::set.
+    //
+    // План строится заново на КАЖДОМ шаге декодирования, и через этот отсев
+    // проходят все занятые ячейки: при двух слотах по 65000 токенов это 130
+    // тысяч вставок в красно-чёрное дерево с отдельным выделением памяти под
+    // каждый узел. Битовая карта на ёмкость кэша — это одно выделение на
+    // 163840/8 = 20 КиБ и постоянное время на ячейку.
+    //
+    // Семантика прежняя: remove_if идёт по порядку, первое вхождение остаётся,
+    // последующие удаляются, выход за ёмкость по-прежнему бросает исключение.
+    std::vector<bool> seen(capacity, false);
     cells.erase(std::remove_if(cells.begin(), cells.end(), [&](uint32_t cell) {
         if (cell >= capacity) {
             throw std::invalid_argument("KVarN compact read-plan cell exceeds cache capacity");
         }
-        return !seen.insert(cell).second;
+        if (seen[cell]) {
+            return true;
+        }
+        seen[cell] = true;
+        return false;
     }), cells.end());
     if (cells.size() > capacity) {
         throw std::invalid_argument("KVarN compact read plan exceeds cache capacity");
     }
 
     const uint32_t used = uint32_t(cells.size());
+
+    // ВЫРАВНИВАНИЕ ПО ГРУППЕ ЗАПИСИ.
+    //
+    // Ядро декода берёт быстрый путь чтения K только когда весь сплит лежит
+    // внутри одной группы записи: `k_split_in_group` требует
+    // `pos_begin + SPLIT_TOKENS <= KVAR_N_GROUP`, где `pos_begin` - остаток
+    // физической ячейки первого элемента сплита по модулю размера группы.
+    // Плотный план укладывает занятые ячейки подряд, поэтому при дырках в
+    // арене (а в объединённом кэше они есть всегда: группы разных
+    // последовательностей чередуются) сплит начинается посреди группы, и K
+    // читается ПОЭЛЕМЕНТНО через load_rotated с рантайм-битностью вместо
+    // распаковки строки записи 32-битными словами.
+    //
+    // Замер счётчиками в ядре (Qwen3.6-35B-A3B, глубина 10000, четыре
+    // одновременных запроса, общий кэш): k_split_in_group срабатывал
+    // 0 раз из 528 блоков, средний pos_begin равнялся 100.
+    //
+    // Здесь каждая затронутая группа занимает РОВНО group_align элементов
+    // плана: полная группа отдаёт свои ячейки подряд (pos_begin становится
+    // нулём), неполная отдаёт свои ячейки и добивается -1. Дырка внутри группы
+    // сдвигала бы всё, что за ней, поэтому неполная группа быстрый путь не
+    // получает - но таких групп по одной на последовательность.
+    //
+    // Защита от фрагментации: если выравненный план вырос бы больше чем на
+    // align_growth_percent процентов, возвращаемся к плотному плану.
+    if (group_align > 0) {
+        std::vector<uint32_t> groups;
+        groups.reserve(cells.size()/group_align + 8);
+        std::vector<bool> group_seen((capacity + group_align - 1u)/group_align, false);
+        for (const uint32_t cell : cells) {
+            const uint32_t g = cell/group_align;
+            if (!group_seen[g]) {
+                group_seen[g] = true;
+                groups.push_back(g);
+            }
+        }
+        std::sort(groups.begin(), groups.end());
+        const uint64_t aligned_used = uint64_t(groups.size())*group_align;
+        const uint64_t limit = uint64_t(used)*(100u + align_growth_percent)/100u;
+        if (aligned_used <= limit && aligned_used <= capacity) {
+            const uint32_t aligned_padded = std::min<uint64_t>(capacity,
+                    std::max<uint64_t>(padding,
+                        ((aligned_used + padding - 1u)/padding)*padding));
+            std::vector<int64_t> aligned(aligned_padded, -1);
+            size_t out = 0;
+            for (const uint32_t g : groups) {
+                const uint32_t begin = g*group_align;
+                const uint32_t end = std::min(begin + group_align, capacity);
+                size_t slot = out;
+                for (uint32_t cell = begin; cell < end; ++cell) {
+                    if (seen[cell]) {
+                        aligned[slot++] = int64_t(cell);
+                    }
+                }
+                out += group_align;
+            }
+            return aligned;
+        }
+    }
+
     const uint32_t padded = std::min(capacity,
             std::max(padding, ((used + padding - 1u)/padding)*padding));
     std::vector<int64_t> result(padded, -1);

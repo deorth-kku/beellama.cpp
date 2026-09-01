@@ -16,6 +16,11 @@
 #include <cstring>
 #include <numeric>
 #include <string>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 #include <vector>
 
 static void require(bool cond, const char * msg) {
@@ -375,6 +380,74 @@ static void kvarn_compact_read_plan_skips_ownership_holes() {
             { 1, 2, 3 }, { 2, 3, 4 }, 128, 256);
     require(deduped.size() == 128 && deduped[0] == 1 && deduped[3] == 4 && deduped[4] == -1,
             "compact KVarN read plan did not deduplicate pending cells");
+
+    // ВЫРАВНИВАНИЕ ПО ГРАНИЦЕ ГРУППЫ ЗАПИСИ (семнадцатая волна).
+    //
+    // В продуктовом пути (llama_kv_cache_kvarn_context::compact_read_plan)
+    // выравнивание включено ПО УМОЛЧАНИЮ, а всеми проверками выше оно обойдено:
+    // они зовут перегрузку с group_align == 0. То есть правка, ради которой
+    // ядро декода вообще получает быстрый путь чтения K в объединённом кэше, не
+    // была покрыта ни одним тестом.
+    {
+        constexpr uint32_t group = 128;
+        // Начатая группа стоит ПЕРВОЙ, за ней две полных. Именно так проверка и
+        // отличает выравненный план от плотного: у полных групп они совпадают
+        // (полная группа и в плотном плане занимает ровно group подряд), а
+        // дырка внутри начатой группы в плотном плане сдвигает всё, что за ней.
+        // Рост 384 против 320 — в пределах 25 процентов по умолчанию, то есть
+        // проверяется ровно та настройка, что работает в продуктовом пути.
+        std::vector<uint32_t> occupied_aligned;
+        for (uint32_t cell = 3*group; cell < 3*group + group/2; ++cell) {
+            occupied_aligned.push_back(cell);
+        }
+        for (uint32_t g : { 5u, 7u }) {
+            for (uint32_t cell = g*group; cell < (g + 1u)*group; ++cell) {
+                occupied_aligned.push_back(cell);
+            }
+        }
+        const auto aligned = llama_kvarn_compact_read_plan(
+                occupied_aligned, {}, 4096, 256, group);
+        require(aligned.size() == 512,
+                "aligned KVarN read plan did not round up to whole write groups");
+        require(aligned[0] == int64_t(3*group) &&
+                aligned[group/2 - 1] == int64_t(3*group + group/2 - 1) &&
+                aligned[group/2] == -1,
+                "aligned KVarN read plan did not pad the incomplete write group");
+        require(aligned[group] == int64_t(5*group) &&
+                aligned[2*group] == int64_t(7*group) &&
+                aligned[3*group] == -1,
+                "aligned KVarN read plan did not start every group on its own boundary");
+    }
+    {
+        constexpr uint32_t group = 128;
+        std::vector<uint32_t> occupied_mixed;
+        for (uint32_t cell = 7*group; cell < 7*group + 4u; ++cell) {
+            occupied_mixed.push_back(cell);
+        }
+        for (uint32_t cell = 3*group; cell < 4*group; ++cell) {
+            occupied_mixed.push_back(cell);
+        }
+        // Защита от фрагментации: выравненный план вырос бы со 132 элементов до
+        // 256, это больше 25 процентов, поэтому возвращается плотный план —
+        // в порядке вызывающей стороны, начиная с начатой группы 7.
+        const auto dense = llama_kvarn_compact_read_plan(
+                occupied_mixed, {}, 4096, 256, group);
+        require(dense.size() == 256 && dense[0] == int64_t(7*group) &&
+                dense[4] == int64_t(3*group),
+                "aligned KVarN read plan ignored its fragmentation guard");
+        // Тот же вход с поднятым порогом роста укладывается по группам и
+        // переупорядочивается по возрастанию номера группы — в отличие от
+        // плотного плана, который порядок вызывающей стороны сохраняет.
+        const auto grouped = llama_kvarn_compact_read_plan(
+                occupied_mixed, {}, 4096, 256, group, 100);
+        require(grouped.size() == 256 &&
+                grouped[0] == int64_t(3*group) &&
+                grouped[group - 1] == int64_t(4*group - 1) &&
+                grouped[group] == int64_t(7*group) &&
+                grouped[group + 3] == int64_t(7*group + 3) &&
+                grouped[group + 4] == -1,
+                "aligned KVarN read plan did not order and pad by write group");
+    }
 }
 
 static void kvarn_planning_reservations_preserve_group_ownership() {
@@ -1024,7 +1097,8 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
         int stage_groups,
         bool emit_rotated = false,
         bool swa = false,
-        int head_slices = 1) {
+        int head_slices = 1,
+        bool eager_records = false) {
     require(records->type == GGML_TYPE_I8, "reference decode records type mismatch");
     require(stage->type == GGML_TYPE_F16, "reference decode stage type mismatch");
     require(stage->ne[0] == 128, "reference decode stage width mismatch");
@@ -1056,19 +1130,31 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
     ggml_backend_tensor_get(records, record_data.data(), 0, record_data.size());
 
     std::vector<int64_t> live_groups(n_stream, 0);
+    // Позиция внутри живой группы нужна только правилу eager: там завершённая
+    // группа читается из записей, а из стейджа - только незавершённая.
+    std::vector<int64_t> live_positions(n_stream, 0);
     for (int64_t idx : indices) {
         if (idx < 0) {
             require(swa, "reference decode negative non-SWA index");
             continue;
         }
         const int64_t group_global = idx / 128;
+        const int64_t pos = idx % 128;
         if (swa) {
-            live_groups[0] = std::max(live_groups[0], group_global);
+            if (group_global > live_groups[0] || (group_global == live_groups[0] && pos > live_positions[0])) {
+                live_groups[0]    = group_global;
+                live_positions[0] = pos;
+            }
         } else {
             const int64_t stream = group_global / groups_per_stream;
             if (stream >= stream_start && stream < stream_start + n_stream) {
                 const int64_t group = group_global - stream * groups_per_stream;
-                live_groups[stream - stream_start] = std::max(live_groups[stream - stream_start], group);
+                int64_t & live_group = live_groups[stream - stream_start];
+                int64_t & live_pos   = live_positions[stream - stream_start];
+                if (group > live_group || (group == live_group && pos > live_pos)) {
+                    live_group = group;
+                    live_pos   = pos;
+                }
             }
         }
     }
@@ -1096,7 +1182,26 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
                 bool from_record;
                 int64_t stage_pos = 0;
                 int64_t record_group = 0;
-                if (swa) {
+                if (eager_records) {
+                    // Правило продуктового пути чтения (ggml-cuda/kvarn.cu,
+                    // ветка eager_records в kvarn_materialize_kernel): из
+                    // стейджа берутся только якорная группа 0 и живая
+                    // НЕЗАВЕРШЁННАЯ группа, всё завершённое - из записей.
+                    // Правила ниже описывают поведение до eager-печати; на
+                    // eager-сторах они дают ложное расхождение, потому что
+                    // завершённая группа в стейдж больше не пишется.
+                    const int64_t live_pos = live_positions[out_stream];
+                    const bool completed = group < live_group ||
+                                           (group == live_group && live_pos == 127);
+                    from_stage  = (!swa && group == 0) || (group == live_group && live_pos < 127);
+                    from_record = !from_stage && completed && (swa ?
+                                  (group >= 0 && live_group - group < groups_per_stream) :
+                                  (group > 0 && group < groups_per_stream));
+                    stage_pos    = stage_base + (swa ? (group % stage_groups) :
+                                   (group == 0 ? 0 : 1 + ((group - 1) % tail_groups))) * 128 + pos;
+                    record_group = (int64_t) stream * groups_per_stream +
+                                   (swa ? group % groups_per_stream : group);
+                } else if (swa) {
                     from_stage  = group >= stage_begin && group <= live_group;
                     from_record = !from_stage && group >= 0 && group < stage_begin &&
                                   (live_group - group) < groups_per_stream + tail_groups;
@@ -1181,9 +1286,11 @@ static std::vector<float> test_kvarn_reference_decode_f32(
         int stage_groups,
         bool emit_rotated = false,
         bool swa = false,
-        int head_slices = 1) {
+        int head_slices = 1,
+        bool eager_records = false) {
     std::vector<ggml_fp16_t> output_f16 = test_kvarn_reference_decode(
-            records, stage, indices, n_kv, stream_start, n_stream, bits, value, stage_groups, emit_rotated, swa, head_slices);
+            records, stage, indices, n_kv, stream_start, n_stream, bits, value, stage_groups, emit_rotated, swa, head_slices,
+            eager_records);
     std::vector<float> output(output_f16.size());
     ggml_fp16_to_fp32_row(output_f16.data(), output.data(), output.size());
     return output;
@@ -1841,7 +1948,8 @@ static std::vector<ggml_fp16_t> test_store_segmented_output(
         full_indices[t] = t;
     }
     std::vector<ggml_fp16_t> output = test_kvarn_reference_decode(
-            records, stored, full_indices, total_tokens, 0, n_stream, bits, value, stage_groups, false, swa, head_slices);
+            records, stored, full_indices, total_tokens, 0, n_stream, bits, value, stage_groups, false, swa, head_slices,
+            eager_records);
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
@@ -2594,6 +2702,114 @@ static void require_close_f32_rmse(
                 rmse, max_diff, double(rmse_limit));
         require(false, message);
     }
+}
+
+// ЧТЕНИЕ ВЫБРАННОЙ ГЕОМЕТРИИ ДЕКОДА.
+//
+// `GGML_CUDA_FA_ROUTE_DEBUG=1` печатает фактическую геометрию (в том числе
+// q_tile) прямым fprintf в stderr, а не через журнал ggml, поэтому колбэк
+// llama_log_set её не видит. Захват дескриптора 2 — единственный способ
+// прочитать её из теста, не заводя поля в ABI телеметрии маршрутов, то есть не
+// трогая продуктовый код. Приём тот же, что у capture_stderr в
+// tests/test-arg-parser.cpp.
+//
+// Внутри перехвата не должно быть ни одного require: его сообщение ушло бы в
+// перехваченный файл и пропало.
+template<typename Fn>
+static std::string test_kvarn_capture_route_debug(Fn && fn) {
+    std::fflush(stderr);
+    FILE * capture = std::tmpfile();
+    require(capture != nullptr, "route-debug capture could not open a temporary file");
+#ifdef _WIN32
+    const int stderr_fd = _fileno(stderr);
+    const int saved_fd  = _dup(stderr_fd);
+    require(saved_fd >= 0, "route-debug capture could not duplicate stderr");
+    const bool redirected = _dup2(_fileno(capture), stderr_fd) == 0;
+#else
+    const int stderr_fd = fileno(stderr);
+    const int saved_fd  = dup(stderr_fd);
+    require(saved_fd >= 0, "route-debug capture could not duplicate stderr");
+    const bool redirected = dup2(fileno(capture), stderr_fd) == stderr_fd;
+#endif
+    if (!redirected) {
+#ifdef _WIN32
+        _close(saved_fd);
+#else
+        close(saved_fd);
+#endif
+        std::fclose(capture);
+        require(false, "route-debug capture could not redirect stderr");
+    }
+
+    fn();
+
+    std::fflush(stderr);
+    std::string result;
+    if (std::fseek(capture, 0, SEEK_SET) == 0) {
+        char buffer[512];
+        while (std::fgets(buffer, sizeof(buffer), capture) != nullptr) {
+            result += buffer;
+        }
+    }
+#ifdef _WIN32
+    _dup2(saved_fd, stderr_fd);
+    _close(saved_fd);
+#else
+    dup2(saved_fd, stderr_fd);
+    close(saved_fd);
+#endif
+    std::fclose(capture);
+    return result;
+}
+
+static void test_kvarn_set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value != nullptr ? value : "");
+#else
+    if (value != nullptr) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
+// Последнее значение q_tile= в захваченной отладке маршрутов; -1, если строк
+// split-декода в ней не было вовсе.
+static int test_kvarn_route_debug_q_tile(const std::string & log) {
+    int value = -1;
+    for (size_t pos = log.find("q_tile="); pos != std::string::npos;
+            pos = log.find("q_tile=", pos + 1)) {
+        value = std::atoi(log.c_str() + pos + 7);
+    }
+    return value;
+}
+
+// `KVARN_ROUTE_MATRIX_REPORT=1` печатает выбранный маршрут и все расхождения
+// для каждой формы матрицы n_q и не останавливает набор на первом несовпадении
+// маршрута (числовые проверки при этом остаются жёсткими). Тот же приём, что у
+// `KVARN_EAGER_UNALIGNED_SOFT` и `KVARN_STAGE_WRITE_THROUGH_REPORT`.
+static bool test_kvarn_route_matrix_report() {
+    static const bool value = std::getenv("KVARN_ROUTE_MATRIX_REPORT") != nullptr;
+    return value;
+}
+
+// Возвращает RMSE вместо остановки набора. Нужен режиму отчёта по матрице
+// маршрутов (`KVARN_ROUTE_MATRIX_REPORT=1`), который печатает расхождения для
+// всех n_q сразу, а не только до первого падения.
+static double test_kvarn_f32_rmse(
+        const std::vector<float> & actual,
+        const std::vector<float> & expected) {
+    require(actual.size() == expected.size(), "f32 RMSE size mismatch");
+    if (actual.empty()) {
+        return 0.0;
+    }
+    double mse = 0.0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        const double diff = double(actual[i]) - double(expected[i]);
+        mse += diff * diff;
+    }
+    return std::sqrt(mse / double(actual.size()));
 }
 
 static void require_segmented_raw_roundtrip(
@@ -3431,8 +3647,28 @@ static void test_native_flash_attention_gpu() {
         test_kvarn_route_stats stats = make_test_kvarn_route_stats(route_stats_abi_version);
         route_stats_get(&stats);
 
+        if (test_kvarn_route_matrix_report()) {
+            std::printf("test-kvarn route-matrix: metadata D%-3d n_q=%-2d gqa=%d bits=%d swa=%d"
+                    " | split=%llu vector=%llu generic=%llu | expect=%s"
+                    " | rmse(spec,cpu)=%.3g rmse(gen,cpu)=%.3g rmse(spec,gen)=%.3g\n",
+                    head_dim, n_q, n_kv_heads > 0 ? n_q_heads / n_kv_heads : 0, bits, int(swa),
+                    (unsigned long long) stats.decode_split,
+                    (unsigned long long) stats.decode_vector,
+                    (unsigned long long) stats.generic_mma,
+                    expect_tiled_mma ? "generic-mma" : "specialized",
+                    swa ? -1.0 : test_kvarn_f32_rmse(actual, expected),
+                    swa ? -1.0 : test_kvarn_f32_rmse(generic, expected),
+                    test_kvarn_f32_rmse(actual, generic));
+            std::fflush(stdout);
+        }
         if (!swa) {
             require_close_f32_rmse(actual, expected, 1e-2f, message);
+            // Общий MMA остаётся под охраной процессорного эталона на тех же
+            // формах, где его вытеснил быстрый маршрут. Без этой строки перевод
+            // ожидания на split-декод снял бы с тайлового MMA единственную
+            // независимую проверку при n_q <= split_max_q.
+            require_close_f32_rmse(generic, expected, 1e-2f,
+                    "generic KVarN MMA reference differs from CPU reference decode");
         }
         require_close_f32_rmse(actual, generic, 1e-4f,
                 "specialized KVarN body output differs from generic KVarN reference");
@@ -3440,14 +3676,16 @@ static void test_native_flash_attention_gpu() {
                 "specialized KVarN body metadata differs from generic KVarN reference");
         require(generic_stats.generic_mma > 0 && generic_stats.decode_split == 0 && generic_stats.decode_vector == 0,
                 "neutral-sink metadata reference did not exercise generic KVarN MMA");
-        if (expect_tiled_mma) {
+        if (test_kvarn_route_matrix_report()) {
+            // отчётный прогон печатает маршрут выше и не обрывается на нём
+        } else if (expect_tiled_mma) {
             require(stats.generic_mma > 0 && stats.decode_split == 0 && stats.decode_vector == 0,
                     "multi-query KVarN decode did not exercise tiled native MMA");
         } else {
             require(stats.decode_split >= min_split && stats.decode_vector >= min_vector,
                     "metadata-capable KVarN decode did not exercise the required specialized route");
             require(stats.generic_mma == 0,
-                    "eligible single-query KVarN decode fell back to generic MMA");
+                    "route-eligible KVarN decode fell back to generic MMA");
         }
         require(actual_meta.size() == size_t(2 * n_q_heads * n_q),
                 "specialized KVarN body metadata has the wrong layout");
@@ -3458,6 +3696,54 @@ static void test_native_flash_attention_gpu() {
         }
     };
 
+    // Порог n_q, до которого политика уводит декод на быстрый split-маршрут:
+    // GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q в
+    // ggml/src/ggml-cuda/fattn-kvarn-route-policy.h. Значение продублировано
+    // здесь НАМЕРЕННО, а не подключено из заголовка: молчаливый сдвиг умолчания
+    // обязан ронять этот набор, а не проходить незамеченным.
+    //
+    // История. До двенадцатой волны порог был равен 1, вся многотокенная
+    // матрица шла на generic MMA, и тест это и требовал. Волны 12 и 17 подняли
+    // порог до 8 ради спекулятивного декодирования, и ожидание устарело.
+    // Переписано оно не вслепую: `KVARN_ROUTE_MATRIX_REPORT=1` печатает и
+    // маршрут, и три расхождения на каждой форме. Замер на 3090, D256, gqa 6,
+    // bits 4, n_kv 1024 (RMSE):
+    //
+    //   n_q   split vs CPU   generic vs CPU   split vs generic
+    //     2     0.000542       0.000543          1.69e-05
+    //     4     0.000568       0.000569          1.61e-05
+    //     8     0.000649       0.000649          2.93e-05
+    //
+    // Быстрый маршрут расходится с процессорным эталоном не больше, чем сам
+    // generic MMA, а между собой маршруты расходятся на два порядка меньше
+    // уровня квантования. То есть маршрут верен, устарело ожидание.
+    //
+    // Покрытие при этом не сузилось, а расширилось: числовые проверки остались
+    // прежними, к ним добавлена прямая сверка generic MMA с процессорным
+    // эталоном (см. require_metadata_case), так что тайловый MMA остаётся под
+    // охраной и на тех формах, где его вытеснил быстрый маршрут, а split-декод
+    // при n_q > 1 впервые оказался под охраной вообще.
+    constexpr int expected_split_max_q = 8;
+    int split_max_q = expected_split_max_q;
+    if (const char * split_max_q_env = std::getenv("GGML_KVARN_SPLIT_MAX_Q")) {
+        split_max_q = std::atoi(split_max_q_env);
+        split_max_q = std::max(1, std::min(16, split_max_q));
+    }
+    int multi_query_split_cases   = 0;
+    int multi_query_generic_cases = 0;
+    const auto require_multi_query_metadata_case =
+        [&](int head_dim, int n_q, int n_q_heads, int n_kv_heads, int bits,
+            const char * message) {
+        const bool tiled_mma = n_q > split_max_q;
+        if (tiled_mma) {
+            ++multi_query_generic_cases;
+        } else {
+            ++multi_query_split_cases;
+        }
+        require_metadata_case(head_dim, n_q, n_q_heads, n_kv_heads, bits, false,
+                tiled_mma ? 0 : 1, 0, tiled_mma, message);
+    };
+
     require_metadata_case(256, 1, 6, 1, 4, false, 1, 0, false,
             "Qwen-like D256 metadata-capable split output differs from reference");
     require_metadata_case(512, 1, 16, 1, 4, false, 1, 0, false,
@@ -3465,13 +3751,24 @@ static void test_native_flash_attention_gpu() {
     require_metadata_case(256, 1, 2, 1, 4, true, 0, 1, false,
             "Gemma-like D256 SWA metadata-capable vector output differs from reference");
     for (int n_q = 2; n_q <= 16; ++n_q) {
-        require_metadata_case(256, n_q, 6, 1, 4, false, 0, 0, true,
-                "multi-token metadata-capable tiled MMA output differs from reference");
+        require_multi_query_metadata_case(256, n_q, 6, 1, 4,
+                "multi-token metadata-capable decode output differs from reference");
     }
-    require_metadata_case(256, 9, 6, 1, 6, false, 0, 0, true,
+    // Типичная глубина спекуляции MTP на шестибитном кэше: до этой волны
+    // шестибитная ветка проверялась только при n_q 9 и 16, то есть только на
+    // generic MMA, а быстрый маршрут на ней не исполнялся ни разу.
+    require_multi_query_metadata_case(256, 3, 6, 1, 6,
+            "KVarN6 speculative-depth decode output differs from reference");
+    require_multi_query_metadata_case(256, 8, 6, 1, 6,
+            "KVarN6 split-threshold decode output differs from reference");
+    require_multi_query_metadata_case(256, 9, 6, 1, 6,
             "KVarN6 DFlash-sized tiled MMA output differs from reference");
-    require_metadata_case(256, 16, 6, 1, 6, false, 0, 0, true,
+    require_multi_query_metadata_case(256, 16, 6, 1, 6,
             "KVarN6 full-block tiled MMA output differs from reference");
+    require(multi_query_split_cases > 0,
+            "multi-query KVarN route matrix no longer covers the split-decode route");
+    require(multi_query_generic_cases > 0,
+            "multi-query KVarN route matrix no longer covers the tiled native MMA route");
 
     const auto require_exact_tail_case = [&](int head_dim, int n_q, int n_q_heads,
                                               int n_kv_heads, bool swa, int tail_tokens,
@@ -3491,18 +3788,32 @@ static void test_native_flash_attention_gpu() {
         test_kvarn_route_stats stats = make_test_kvarn_route_stats(route_stats_abi_version);
         route_stats_get(&stats);
 
+        if (test_kvarn_route_matrix_report()) {
+            std::printf("test-kvarn route-matrix: exact-tail D%-3d n_q=%-2d gqa=%d tail=%-4d swa=%d"
+                    " | split=%llu vector=%llu generic=%llu | expect=%s"
+                    " | rmse(spec,gen)=%.3g\n",
+                    head_dim, n_q, n_kv_heads > 0 ? n_q_heads / n_kv_heads : 0, tail_tokens, int(swa),
+                    (unsigned long long) stats.decode_split,
+                    (unsigned long long) stats.decode_vector,
+                    (unsigned long long) stats.generic_mma,
+                    expect_tiled_mma ? "generic-mma" : "specialized",
+                    test_kvarn_f32_rmse(actual, generic));
+            std::fflush(stdout);
+        }
         require_close_f32_rmse(actual, generic, 1e-4f, message);
         require(generic_stats.generic_mma > 0 &&
                 generic_stats.decode_split == 0 && generic_stats.decode_vector == 0,
                 "exact-tail reference did not exercise generic KVarN MMA");
-        if (expect_tiled_mma) {
+        if (test_kvarn_route_matrix_report()) {
+            // отчётный прогон печатает маршрут выше и не обрывается на нём
+        } else if (expect_tiled_mma) {
             require(stats.generic_mma > 0 && stats.decode_split == 0 && stats.decode_vector == 0,
                     "multi-query exact-tail KVarN body did not exercise tiled native MMA");
         } else {
             require(stats.decode_split >= min_split && stats.decode_vector >= min_vector,
                     "exact-tail KVarN body did not exercise the required specialized route");
             require(stats.generic_mma == 0,
-                    "eligible single-query exact-tail KVarN body fell back to generic MMA");
+                    "route-eligible exact-tail KVarN body fell back to generic MMA");
         }
     };
 
@@ -3517,10 +3828,23 @@ static void test_native_flash_attention_gpu() {
             "D512 exact-tail merge differs from generic KVarN reference");
     require_exact_tail_case(256, 1, 2, 1, true, 128, 0, 1, false,
             "D256 SWA vector exact-tail merge differs from generic KVarN reference");
+    int exact_tail_split_cases   = 0;
+    int exact_tail_generic_cases = 0;
     for (int n_q = 2; n_q <= 16; ++n_q) {
-        require_exact_tail_case(256, n_q, 6, 1, false, 128, 0, 0, true,
-                "speculative exact-tail tiled MMA output differs from generic KVarN reference");
+        // Тот же порог, что и у матрицы метаданных выше.
+        const bool tiled_mma = n_q > split_max_q;
+        if (tiled_mma) {
+            ++exact_tail_generic_cases;
+        } else {
+            ++exact_tail_split_cases;
+        }
+        require_exact_tail_case(256, n_q, 6, 1, false, 128, tiled_mma ? 0 : 1, 0, tiled_mma,
+                "speculative exact-tail decode output differs from generic KVarN reference");
     }
+    require(exact_tail_split_cases > 0,
+            "multi-query exact-tail route matrix no longer covers the split-decode route");
+    require(exact_tail_generic_cases > 0,
+            "multi-query exact-tail route matrix no longer covers the tiled native MMA route");
 
     for (int head_dim : { 128, 256, 512 }) {
         constexpr int n_q_native = 4;
@@ -3795,6 +4119,217 @@ static void test_native_flash_attention_gpu() {
                 "single-token GQA deep K4/V4 native KVarN FlashAttention output differs from CPU reference decode");
     }
 
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+}
+
+// ПОКРЫТИЕ ШИРИНЫ ТАЙЛА СТРОК ЗАПРОСА (Q_TILE, двенадцатая волна).
+//
+// Ширина выбирается оценкой кандидатов по числу волн. На формах основной
+// матрицы маршрутов n_kv = 1024, блоков заведомо меньше одной волны, и оценка
+// всегда берёт тайл 1. То есть ядра с Q_TILE 2 и 3, ради которых написан самый
+// крупный патч стопки, не исполнял ни один тест.
+//
+// Здесь закрываются обе стороны: САМИ ЯДРА (принудительная ширина через
+// GGML_KVARN_Q_TILE) и ЛОГИКА ВЫБОРА (форма, на которой оценка сама берёт
+// широкий тайл). Фактическая ширина в обоих случаях читается из отладки
+// маршрутов, а не предполагается.
+//
+// Тайл шире одной строки инстанцируется только при D = 256, MAX_GQA = 6,
+// сплит 128; gqa_ratio при этом произволен — он лишь задаёт число блоков по
+// головам, ceil(gqa/6).
+struct test_kvarn_q_tile_case {
+    int head_dim;
+    int n_q;
+    int n_q_heads;
+    int n_kv_heads;
+    int bits;
+    int n_kv;
+};
+
+// Прогоняет одну форму: процессорный эталон, опорный generic MMA (через
+// нейтральные sink'и) и специализированный маршрут с чтением фактической
+// геометрии. Возвращает наблюдённую ширину тайла.
+static int test_kvarn_run_q_tile_case(
+        ggml_backend_t cpu_backend,
+        ggml_backend_t gpu_backend,
+        test_kvarn_route_stats_reset_fn route_stats_reset,
+        test_kvarn_route_stats_get_fn route_stats_get,
+        const test_kvarn_q_tile_case & c,
+        const char * what) {
+    const int gqa = c.n_kv_heads > 0 ? c.n_q_heads / c.n_kv_heads : 0;
+
+    const std::vector<float> expected = test_native_flash_attention_output(
+            cpu_backend, false, false, c.head_dim, c.bits, c.bits, c.n_q,
+            c.n_q_heads, c.n_kv_heads, c.n_kv, 5, false);
+
+    std::vector<float> generic_meta;
+    route_stats_reset();
+    const std::vector<float> generic = test_native_flash_attention_output(
+            gpu_backend, true, true, c.head_dim, c.bits, c.bits, c.n_q,
+            c.n_q_heads, c.n_kv_heads, c.n_kv, 5, false, &generic_meta, true);
+    test_kvarn_route_stats generic_stats = make_test_kvarn_route_stats();
+    route_stats_get(&generic_stats);
+
+    std::vector<float> actual_meta;
+    std::vector<float> actual;
+    route_stats_reset();
+    // Отладка маршрутов читается через getenv на каждом вызове, поэтому её
+    // можно включать точечно и не заливать журнал всего набора.
+    test_kvarn_set_env("GGML_CUDA_FA_ROUTE_DEBUG", "1");
+    const std::string route_log = test_kvarn_capture_route_debug([&]() {
+        actual = test_native_flash_attention_output(
+                gpu_backend, true, true, c.head_dim, c.bits, c.bits, c.n_q,
+                c.n_q_heads, c.n_kv_heads, c.n_kv, 5, false, &actual_meta);
+    });
+    test_kvarn_set_env("GGML_CUDA_FA_ROUTE_DEBUG", nullptr);
+    test_kvarn_route_stats stats = make_test_kvarn_route_stats();
+    route_stats_get(&stats);
+    const int q_tile = test_kvarn_route_debug_q_tile(route_log);
+
+    if (test_kvarn_route_matrix_report()) {
+        std::printf("test-kvarn route-matrix: %s D%-3d n_q=%-2d gqa=%-2d bits=%d n_kv=%-5d"
+                " | split=%llu generic=%llu q_tile=%d"
+                " | rmse(spec,cpu)=%.3g rmse(gen,cpu)=%.3g rmse(spec,gen)=%.3g\n",
+                what, c.head_dim, c.n_q, gqa, c.bits, c.n_kv,
+                (unsigned long long) stats.decode_split,
+                (unsigned long long) stats.generic_mma,
+                q_tile,
+                test_kvarn_f32_rmse(actual, expected),
+                test_kvarn_f32_rmse(generic, expected),
+                test_kvarn_f32_rmse(actual, generic));
+        std::fflush(stdout);
+    }
+
+    require(generic_stats.generic_mma > 0 && generic_stats.decode_split == 0,
+            "q-tile reference did not exercise generic KVarN MMA");
+    require(stats.decode_split > 0 && stats.generic_mma == 0,
+            "q-tile case did not reach the split-decode kernel");
+    require_close_f32_rmse(actual, expected, 1e-2f,
+            "KVarN split decode differs from the CPU reference decode");
+    require_close_f32_rmse(actual, generic, 1e-4f,
+            "KVarN split decode differs from the generic KVarN reference");
+    require_attention_meta_close(actual_meta, generic_meta,
+            "KVarN split decode metadata differs from the generic KVarN reference");
+    require(q_tile > 0,
+            "route debug did not report the decode geometry; GGML_CUDA_FA_ROUTE_DEBUG is not honoured");
+    return q_tile;
+}
+
+// Принудительная ширина: GGML_KVARN_Q_TILE отбрасывает всех кандидатов, кроме
+// заданной. Если ширина неприменима, кандидатов нет вовсе, use_split остаётся
+// ложным, вызов уходит на generic MMA и decode_split остаётся нулём — это
+// ловит require внутри test_kvarn_run_q_tile_case. Сверх того наблюдённая
+// ширина сверяется с заданной напрямую.
+//
+// Переменная читается один раз на процесс (function-local static в
+// fattn-mma-kvarn-decode.cuh), поэтому перебрать ширины внутри одного прогона
+// нельзя: ctest заводит отдельные записи test-kvarn-q-tile-2 и -q-tile-3, а
+// main() при заданной переменной выполняет только эту матрицу — остальной набор
+// законно ждёт тайл 1 на однотокенных формах.
+static void test_native_flash_attention_forced_q_tile(int forced_tile) {
+    require(forced_tile >= 2 && forced_tile <= 3,
+            "forced KVarN query tile outside the instantiated width range");
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (gpu_backend == nullptr) {
+        return;
+    }
+    if (!backend_supports_kvarn_flash_attention_shape(gpu_backend, 256)) {
+        ggml_backend_free(gpu_backend);
+        return;
+    }
+    const auto [route_stats_reset, route_stats_get] = get_kvarn_route_stats_fns(gpu_backend);
+    if (route_stats_reset == nullptr || route_stats_get == nullptr) {
+        // Портируемые бэкенды без CUDA-телеметрии маршрутов; ширины тайла у них нет.
+        ggml_backend_free(gpu_backend);
+        return;
+    }
+    ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+
+    int covered = 0;
+    // Число голов GQA задаёт число блоков ceil(gqa/6): проверяются и неполный
+    // блок (1..5), и ровный (6), и два блока (12). До этой волны широкий тайл
+    // проверялся только при gqa = 6.
+    for (int gqa : { 1, 2, 3, 4, 6, 12 }) {
+        const int bits = gqa == 6 ? 6 : 4;
+        for (int n_q = forced_tile; n_q <= 8; n_q += (gqa == 6 ? 1 : 3)) {
+            const test_kvarn_q_tile_case c = { 256, n_q, gqa, 1, bits, 1024 };
+            const int q_tile = test_kvarn_run_q_tile_case(
+                    cpu_backend, gpu_backend, route_stats_reset, route_stats_get,
+                    c, "q-tile-forced");
+            require(q_tile == forced_tile,
+                    "forced KVarN query tile was not the width the decode kernel actually ran");
+            ++covered;
+        }
+    }
+    // Шестибитная ветка при gqa 6 покрыта выше; здесь добавляется четырёхбитная
+    // на той же ширине GQA, чтобы обе битности прошли через широкое ядро.
+    for (int n_q = forced_tile; n_q <= 8; n_q += 2) {
+        const test_kvarn_q_tile_case c = { 256, n_q, 6, 1, 4, 1024 };
+        const int q_tile = test_kvarn_run_q_tile_case(
+                cpu_backend, gpu_backend, route_stats_reset, route_stats_get,
+                c, "q-tile-forced");
+        require(q_tile == forced_tile,
+                "forced KVarN query tile was not the width the decode kernel actually ran");
+        ++covered;
+    }
+    require(covered > 0, "forced KVarN query tile matrix covered no shape");
+
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+}
+
+// ЕСТЕСТВЕННЫЙ ВЫБОР ШИРИНЫ. Принудительный режим проверяет ядра, но не
+// оценку кандидатов, которая ширину и выбирает. Оценка ставит первым слагаемым
+// число волн, а оно падает вместе с числом тайлов строк запроса, поэтому
+// широкий тайл выигрывает только когда блоков хватает больше чем на одну
+// волну. На n_kv = 1024 их заведомо меньше, отсюда и дыра.
+//
+// Здесь берётся форма с n_kv в шестнадцать тысяч: сплитов 128, при n_q = 3 и
+// тайле 1 блоков 384 против 328 резидентных на 3090 — две волны; тайл 2 даёт
+// 256 блоков и одну волну и потому выигрывает. Ширина не предполагается, а
+// читается из отладки маршрутов, и требуется только «шире одной строки»:
+// точное значение зависит от числа мультипроцессоров устройства.
+static void test_native_flash_attention_natural_q_tile() {
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (gpu_backend == nullptr) {
+        return;
+    }
+    if (!backend_supports_kvarn_flash_attention_shape(gpu_backend, 256)) {
+        ggml_backend_free(gpu_backend);
+        return;
+    }
+    const auto [route_stats_reset, route_stats_get] = get_kvarn_route_stats_fns(gpu_backend);
+    if (route_stats_reset == nullptr || route_stats_get == nullptr) {
+        ggml_backend_free(gpu_backend);
+        return;
+    }
+    if (std::getenv("GGML_KVARN_Q_TILE") != nullptr ||
+            std::getenv("GGML_KVARN_SPLIT_TOKENS") != nullptr) {
+        // Принудительная геометрия отменяет сам предмет проверки.
+        ggml_backend_free(gpu_backend);
+        return;
+    }
+    ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+
+    const test_kvarn_q_tile_case wide = { 256, 3, 6, 1, 4, 16384 };
+    const int wide_tile = test_kvarn_run_q_tile_case(
+            cpu_backend, gpu_backend, route_stats_reset, route_stats_get,
+            wide, "q-tile-natural");
+    require(wide_tile > 1,
+            "candidate scoring did not select a wide query tile where it removes a whole wave");
+
+    // Контроль на противоположную ошибку: при одной строке запроса широкий тайл
+    // не имеет смысла и обязан быть отвергнут независимо от числа волн.
+    const test_kvarn_q_tile_case narrow = { 256, 1, 6, 1, 4, 16384 };
+    const int narrow_tile = test_kvarn_run_q_tile_case(
+            cpu_backend, gpu_backend, route_stats_reset, route_stats_get,
+            narrow, "q-tile-natural");
+    require(narrow_tile == 1,
+            "candidate scoring selected a wide query tile for a single query row");
+
+    std::printf("test-kvarn: natural q_tile selection wide=%d narrow=%d OK\n",
+            wide_tile, narrow_tile);
     ggml_backend_free(cpu_backend);
     ggml_backend_free(gpu_backend);
 }
@@ -4454,7 +4989,8 @@ static void test_eager_unaligned_start(enum ggml_backend_dev_type device_type, b
     }
 
     const std::vector<float> output = test_kvarn_reference_decode_f32(
-            records, stored, idx, total_tokens, 0, 1, bits, false, stage_groups);
+            records, stored, idx, total_tokens, 0, 1, bits, false, stage_groups,
+            /*emit_rotated =*/ false, /*swa =*/ false, /*head_slices =*/ 1, /*eager_records =*/ true);
 
     double mse = 0.0;
     double max_diff = 0.0;
@@ -4481,6 +5017,274 @@ static void test_eager_unaligned_start(enum ggml_backend_dev_type device_type, b
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
+    ggml_backend_free(backend);
+}
+
+// Детерминированный стенд: сквозная запись стейджа портит живую незавершённую
+// группу чужой последовательности.
+//
+// Незавершённая группа из 128 токенов живёт ТОЛЬКО в буфере F16 (стейдже), её
+// место там - арифметика по номеру группы: slot(g) = (g == 0) ? 0 : 1 + ((g-1) %
+// tail_groups). При stage_groups = 3 получается tail_groups = 2, то есть группы
+// 1 и 3 садятся в один и тот же слот 1. Это самая короткая пара для опыта.
+//
+//   шаг А  64 токена в ячейки 128..191  -> группа 1 живая, 64/128, слот 1
+//   шаг Б  384 токена в ячейки 256..639 -> группы 2, 3 и 4 целиком внутри стора;
+//                                          384 >= 3 * 128, поэтому стор идёт по
+//                                          непрерывной workspace-ветке
+//   шаг В  64 токена в ячейки 192..255  -> группа 1 дозаполнена и запечатана из
+//                                          слота 1
+//
+// Группы 2, 3 и 4 запечатываются прямо из рабочего буфера (сшивающее ядро читает
+// workspace на всём диапазоне [start_local, end_local)), их строки F16 после
+// стора не нужны никому. Прежнее поведение (GGML_KVARN_STAGE_PASSTHROUGH=1) всё
+// равно выбирало для каждого слота кольца последнюю попавшую в него группу стора
+// и писало её строки: группа 3 ложилась в слот 1 поверх живых строк группы 1.
+// Шаг В запекает эту порчу в запись группы 1 навсегда.
+//
+// Опыт детерминирован: один граф ggml, один поток, порядок сторов задан
+// зависимостью по данным (выход предыдущего стора - вход стейджа следующего).
+struct kvarn_stage_write_through_probe {
+    std::vector<float>       decoded;    // n_kv * 128 * n_heads
+    std::vector<ggml_fp16_t> live_rows;  // живые строки слота 1 (64 * 128 * n_heads)
+    int                      n_heads = 1;
+    bool                     stats_known = false;
+    uint64_t                 workspace_stores = 0;
+    uint64_t                 per_token_stores = 0;
+};
+
+static kvarn_stage_write_through_probe kvarn_run_stage_write_through(
+        ggml_backend_t backend, int bits, bool with_long_store,
+        int n_heads = 1, int stage_groups = 3) {
+    require(n_heads >= 1, "stage-write-through: invalid head count");
+    require(stage_groups >= 3, "stage-write-through: stage depth is too shallow for the experiment");
+    const int tail_groups       = stage_groups - 1;
+    const int groups_per_stream = tail_groups + 6;
+    const int victim_group      = 1;
+    const int victim_half       = 64;
+    const int victim_start      = victim_group * 128;
+    // Группа-нарушитель делит слот стейджа с живой группой 1; при кольце в
+    // tail_groups слотов это группа 1 + tail_groups. Длинный стор обязан
+    // покрыть её ЦЕЛИКОМ и начинаться с группы 2, иначе прежнее commit-ядро не
+    // выбрало бы её как наибольшую попавшую в слот.
+    // Стор покрывает группы 2..attacker+1: лишняя группа за нарушителем нужна,
+    // чтобы выбор «наибольшая группа стора, попавшая в этот слот» был
+    // нетривиальным — она в слот живой группы не ложится.
+    const int attacker_group    = victim_group + tail_groups;
+    const int long_start        = 2 * 128;
+    const int long_tokens       = attacker_group * 128;
+    const int n_kv              = long_start + long_tokens;
+    const int probe_group       = groups_per_stream - 1; // "последовательность ушла вперёд"
+
+    const auto stage_slot = [&](int group) {
+        return group == 0 ? 0 : 1 + ((group - 1) % tail_groups);
+    };
+    require(stage_slot(victim_group) == stage_slot(attacker_group),
+            "стенд бессмыслен: живая группа и нарушитель обязаны делить один слот стейджа");
+    require(attacker_group < probe_group,
+            "стенд бессмыслен: пробная группа обязана лежать за длинным стором");
+    require(long_tokens >= 3 * 128,
+            "стенд бессмыслен: короткий стор не уйдёт в ядро с рабочим буфером");
+
+    const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 8 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "stage-write-through: failed to initialize ggml context");
+
+    ggml_tensor * stage   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 128 * stage_groups);
+    ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, groups_per_stream);
+
+    ggml_tensor * current_a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, victim_half);
+    ggml_tensor * indices_a = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, victim_half);
+    ggml_tensor * current_b = with_long_store ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, long_tokens) : nullptr;
+    ggml_tensor * indices_b = with_long_store ? ggml_new_tensor_1d(ctx, GGML_TYPE_I64, long_tokens) : nullptr;
+    ggml_tensor * current_c = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, victim_half);
+    ggml_tensor * indices_c = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, victim_half);
+
+    // op_params[3] - подсказка tokens_per_stream, op_params[9] - eager-печать
+    // записей; и то и другое кэш KVarN всегда проставляет сам.
+    ggml_tensor * stored = ggml_kvarn_store(ctx, current_a, indices_a, stage, records, bits, 16, false, stage_groups);
+    stored->op_params[3] = victim_half;
+    stored->op_params[9] = 1;
+    if (with_long_store) {
+        stored = ggml_kvarn_store(ctx, current_b, indices_b, stored, records, bits, 16, false, stage_groups);
+        stored->op_params[3] = long_tokens;
+        stored->op_params[9] = 1;
+    }
+    stored = ggml_kvarn_store(ctx, current_c, indices_c, stored, records, bits, 16, false, stage_groups);
+    stored->op_params[3] = victim_half;
+    stored->op_params[9] = 1;
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, stored);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "stage-write-through: failed to allocate tensors");
+
+    // Значения сильно зависят от абсолютной позиции по каждому измерению, иначе
+    // подмена живой группы группой-нарушителем была бы неотличима от шума
+    // квантования. Слагаемое по голове отличает головы друг от друга; при
+    // h == 0 оно равно нулю, поэтому одноголовый стенд даёт ровно те же числа,
+    // что и до расширения.
+    auto sample = [](int abs_pos, int d, int h) {
+        return std::sin(float(d) * 0.071f + float(abs_pos) * 0.113f) +
+               0.5f * std::cos(float(d) * 0.031f - float(abs_pos) * 0.047f) +
+               0.37f * float(h);
+    };
+
+    auto fill = [&](ggml_tensor * current, ggml_tensor * indices, int first_cell, int n) {
+        std::vector<float>   data((size_t) 128 * n_heads * n);
+        std::vector<int64_t> idx(n);
+        for (int t = 0; t < n; ++t) {
+            idx[t] = int64_t(first_cell + t);
+            for (int h = 0; h < n_heads; ++h) {
+                for (int d = 0; d < 128; ++d) {
+                    data[((size_t) t * n_heads + h) * 128 + d] = sample(first_cell + t, d, h);
+                }
+            }
+        }
+        ggml_backend_tensor_set(current, data.data(), 0, ggml_nbytes(current));
+        ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
+    };
+
+    std::vector<uint8_t> stage_zeros(ggml_nbytes(stage), 0);
+    std::vector<uint8_t> record_zeros(ggml_nbytes(records), 0);
+    ggml_backend_tensor_set(stage, stage_zeros.data(), 0, stage_zeros.size());
+    ggml_backend_tensor_set(records, record_zeros.data(), 0, record_zeros.size());
+
+    fill(current_a, indices_a, victim_start, victim_half);
+    if (with_long_store) {
+        fill(current_b, indices_b, long_start, long_tokens);
+    }
+    fill(current_c, indices_c, victim_start + victim_half, victim_half);
+
+    kvarn_stage_write_through_probe probe;
+    const auto [store_stats_reset, store_stats_get] = get_kvarn_store_route_stats_fns(backend);
+    if (store_stats_reset != nullptr && store_stats_get != nullptr) {
+        store_stats_reset();
+    }
+
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "stage-write-through: graph compute failed");
+
+    if (store_stats_reset != nullptr && store_stats_get != nullptr) {
+        test_kvarn_store_route_stats stats = make_test_kvarn_store_route_stats();
+        store_stats_get(&stats);
+        probe.stats_known       = true;
+        probe.workspace_stores  = stats.single_slice_workspace + stats.headwide_workspace;
+        probe.per_token_stores  = stats.high_shared_fallback + stats.low_shared_store;
+    }
+
+    // Живые строки незавершённой группы 1 лежат в слоте 1 стейджа, строки
+    // [128, 128 + 64) по третьему измерению.
+    std::vector<ggml_fp16_t> stage_data(ggml_nelements(stage));
+    ggml_backend_tensor_get(stage, stage_data.data(), 0, ggml_nbytes(stage));
+    const size_t slot_base = (size_t) 128 * 128 * n_heads;
+    probe.live_rows.assign(stage_data.begin() + ptrdiff_t(slot_base),
+                           stage_data.begin() + ptrdiff_t(slot_base + (size_t) victim_half * 128 * n_heads));
+
+    // Читаем так, как читал бы сервер после того, как последовательность ушла
+    // вперёд: живой считается группа 7, значит группы 1..4 берутся из записей.
+    probe.n_heads = n_heads;
+    const std::vector<int64_t> probe_indices = { int64_t(probe_group) * 128 };
+    probe.decoded = test_kvarn_reference_decode_f32(
+            records, stored, probe_indices, n_kv, 0, 1, bits, false, stage_groups,
+            /*emit_rotated =*/ false, /*swa =*/ false, /*head_slices =*/ 1, /*eager_records =*/ true);
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return probe;
+}
+
+static void test_stage_write_through_live_group(enum ggml_backend_dev_type device_type, bool required, int bits,
+        int n_heads = 1, int stage_groups = 3) {
+    ggml_backend_t backend = init_test_backend(device_type, required);
+    if (backend == nullptr) {
+        return;
+    }
+
+    const int tail_groups  = stage_groups - 1;
+    const int victim_start = 128;
+    const int victim_end   = 256;                             // живая группа 1 целиком
+    const int others_end   = 2 * 128 + (1 + tail_groups) * 128; // группы длинного стора
+
+    const kvarn_stage_write_through_probe quiet   =
+        kvarn_run_stage_write_through(backend, bits, false, n_heads, stage_groups);
+    const kvarn_stage_write_through_probe crossed =
+        kvarn_run_stage_write_through(backend, bits, true, n_heads, stage_groups);
+
+    auto sample = [](int abs_pos, int d, int h) {
+        return std::sin(float(d) * 0.071f + float(abs_pos) * 0.113f) +
+               0.5f * std::cos(float(d) * 0.031f - float(abs_pos) * 0.047f) +
+               0.37f * float(h);
+    };
+    auto range_rmse = [&](const std::vector<float> & decoded, int first_cell, int last_cell) {
+        double mse = 0.0;
+        for (int cell = first_cell; cell < last_cell; ++cell) {
+            for (int h = 0; h < n_heads; ++h) {
+                for (int d = 0; d < 128; ++d) {
+                    const size_t off = (size_t) d + (size_t) h * 128 +
+                        (size_t) cell * 128 * size_t(n_heads);
+                    const double diff = double(sample(cell, d, h)) - double(decoded[off]);
+                    mse += diff * diff;
+                }
+            }
+        }
+        return std::sqrt(mse / double((last_cell - first_cell) * 128 * n_heads));
+    };
+
+    size_t changed  = 0;
+    double max_diff = 0.0;
+    for (size_t i = 0; i < crossed.live_rows.size(); ++i) {
+        if (crossed.live_rows[i] != quiet.live_rows[i]) {
+            ++changed;
+        }
+        max_diff = std::max(max_diff,
+                std::fabs(double(ggml_fp16_to_fp32(crossed.live_rows[i])) -
+                          double(ggml_fp16_to_fp32(quiet.live_rows[i]))));
+    }
+
+    const double victim_rmse = range_rmse(crossed.decoded, victim_start, victim_end);
+    const double others_rmse = range_rmse(crossed.decoded, victim_end,  others_end);
+    const double quiet_rmse  = range_rmse(quiet.decoded,   victim_start, victim_end);
+    const double limit = 0.15;
+
+    // Разбор опыта печатается целиком, чтобы падение сразу давало числа обеих
+    // проверок, а не только первой.
+    const bool route_bad = crossed.stats_known &&
+            (crossed.workspace_stores != 1 || crossed.per_token_stores != 2 || quiet.workspace_stores != 0);
+    const bool stage_bad = changed != 0;
+    const bool read_bad  = !std::isfinite(victim_rmse) || victim_rmse >= limit ||
+                           !std::isfinite(others_rmse) || others_rmse >= limit ||
+                           !std::isfinite(quiet_rmse)  || quiet_rmse  >= limit;
+    // Подспорье для разбора: KVARN_STAGE_WRITE_THROUGH_SOFT=1 печатает всю
+    // матрицу вместо остановки на первом падении, KVARN_STAGE_WRITE_THROUGH_REPORT=1
+    // печатает числа и на зелёном прогоне.
+    const bool soft = std::getenv("KVARN_STAGE_WRITE_THROUGH_SOFT") != nullptr;
+    if (route_bad || stage_bad || read_bad || soft ||
+            std::getenv("KVARN_STAGE_WRITE_THROUGH_REPORT") != nullptr) {
+        std::fprintf(stderr,
+                "stage-write-through[bits=%d heads=%d stage_groups=%d]: маршрут длинного стора "
+                "workspace=%llu per-token=%llu "
+                "(контроль workspace=%llu); живые строки F16 группы 1 изменены в %zu из %zu значений, "
+                "максимальное расхождение %g; чтение после дозаполнения: группа 1 rmse=%g, "
+                "группы длинного стора rmse=%g, контроль без чужого стора rmse=%g, порог %g\n",
+                bits, n_heads, stage_groups,
+                (unsigned long long) crossed.workspace_stores,
+                (unsigned long long) crossed.per_token_stores,
+                (unsigned long long) quiet.workspace_stores,
+                changed, crossed.live_rows.size(), max_diff,
+                victim_rmse, others_rmse, quiet_rmse, limit);
+    }
+    require(soft || !route_bad, "stage-write-through: длинный стор не попал в непрерывную workspace-ветку");
+    require(soft || !stage_bad, "stage-write-through: сквозная запись стейджа затёрла живую незавершённую группу");
+    require(soft || !read_bad,  "stage-write-through: порча живой группы дожила до чтения записи");
+
     ggml_backend_free(backend);
 }
 
@@ -4933,6 +5737,23 @@ int main() {
         return 0;
     }
 
+    if (const char * forced_tile_env = std::getenv("GGML_KVARN_Q_TILE")) {
+        const int forced_tile = std::atoi(forced_tile_env);
+        if (forced_tile > 1) {
+            // Принудительная ширина тайла делает однотокенные формы остального
+            // набора неприменимыми к split-декоду, поэтому прогон сужается до
+            // матрицы, ради которой переменная и задана.
+            test_native_flash_attention_forced_q_tile(forced_tile);
+            std::printf("test-kvarn: forced q_tile=%d split-decode matrix OK\n", forced_tile);
+            return 0;
+        }
+    }
+
+    if (std::getenv("KVARN_TEST_NATURAL_Q_TILE_ONLY") != nullptr) {
+        test_native_flash_attention_natural_q_tile();
+        return 0;
+    }
+
     if (std::getenv("GGML_KVARN_TEST_PREFILL_PARITY_ONLY") != nullptr) {
         test_native_flash_attention_prefill_route_parity();
         std::printf("test-kvarn: prefill route parity OK\n");
@@ -5022,6 +5843,41 @@ int main() {
             test_eager_unaligned_start(GGML_BACKEND_DEVICE_TYPE_GPU, false, start, n, 6);
         }
     }
+    // Сквозная запись стейджа: длинный непрерывный стор не имеет права трогать
+    // строки F16 живой незавершённой группы чужой последовательности.
+    // GGML_KVARN_STAGE_PASSTHROUGH=1 возвращает прежнее поведение, и тест падает.
+    for (int bits : { 6, 8 }) {
+        test_stage_write_through_live_group(GGML_BACKEND_DEVICE_TYPE_GPU, false, bits);
+    }
+    // Многоголовые пути стора идут через тот же kvarn_store_workspace_commit_kernel,
+    // но в его head-wide варианте; восемнадцатая волна их не покрывала.
+    // Головы различимы по значению (слагаемое 0.37*h), поэтому подмена головы,
+    // а не только группы, тоже поймается.
+    for (int heads : { 2, 4 }) {
+        test_stage_write_through_live_group(GGML_BACKEND_DEVICE_TYPE_GPU, false, 6, heads);
+    }
+    // Кольцо шире двух слотов: восемнадцатая волна ставила опыт на самом узком
+    // (tail_groups = 2), а продуктовое кольцо равно 2 * n_seq_max. Арифметика
+    // столкновения от ширины не зависит — меняется только длина стора, нужная,
+    // чтобы пройти по кольцу; здесь это проверяется, а не предполагается.
+    test_stage_write_through_live_group(GGML_BACKEND_DEVICE_TYPE_GPU, false, 6, 1, 5);
+    test_stage_write_through_live_group(GGML_BACKEND_DEVICE_TYPE_GPU, false, 6, 2, 5);
+    // ПУТЬ CPU: `KVARN_STAGE_WRITE_THROUGH_CPU=1` ставит тот же опыт на
+    // процессорном бэкенде, и он ПАДАЕТ. Восемнадцатая волна заключила по
+    // чтению кода, что процессорный путь запечатывает группу из стейджа и этой
+    // опасности не имеет; стенд это опровергает: 8192 из 8192 живых значений
+    // F16 затёрты, RMSE записи живой группы 0.96 против контрольных 0.0119 —
+    // ровно те же числа, что даёт GGML_KVARN_STAGE_PASSTHROUGH=1 на GPU.
+    //
+    // Файл ggml/src/ggml-cpu/ops.cpp побайтово совпадает с чистым тегом
+    // preview-v0.4.4, то есть это пре-существующее поведение, а не наша правка.
+    // Проверка оставлена за переменной, а не включена в набор: чинить
+    // процессорный стор — правка продуктового кода со своей регрессией, и она
+    // в эту волну не входила. Разбор — в FINDINGS.
+    if (std::getenv("KVARN_STAGE_WRITE_THROUGH_CPU") != nullptr) {
+        test_stage_write_through_live_group(GGML_BACKEND_DEVICE_TYPE_CPU, true, 6, 1, 3);
+        test_stage_write_through_live_group(GGML_BACKEND_DEVICE_TYPE_CPU, true, 6, 1, 5);
+    }
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_CPU, true, 6);
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_GPU, false, 6);
     test_cache_ops_swa(GGML_BACKEND_DEVICE_TYPE_CPU, true);
@@ -5030,6 +5886,7 @@ int main() {
     test_native_flash_attention_support_gates();
     test_native_flash_attention_cpu();
     test_native_flash_attention_gpu();
+    test_native_flash_attention_natural_q_tile();
     test_native_flash_attention_prefill_route_parity();
     test_rotated_decode_transform_consistency(GGML_BACKEND_DEVICE_TYPE_CPU, true);
     test_rotated_decode_transform_consistency(GGML_BACKEND_DEVICE_TYPE_GPU, false);

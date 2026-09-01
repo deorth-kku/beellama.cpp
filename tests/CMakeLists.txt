@@ -346,6 +346,28 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_SETUP generate-models
     )
 
+    # Охрана десятого патча стопки (kvarn-group-claim, шестнадцатая волна).
+    #
+    # Нужен кэш KVarN, а тому нужна голова 128/256/512: у скачиваемого
+    # stories15M она 48, поэтому берётся синтетическая модель из
+    # test-generate-models — у неё key_length 128. Архитектура именно llama:
+    # qwen35 гибридный, его внимание уходит в llama_memory_hybrid, где
+    # структурной раскладки по группам нет.
+    #
+    # --kv-tail-tokens 1024 обязателен: без явного запроса политика хвоста
+    # делает хвост равным окну, представление становится native_exact, и модель
+    # строит обычный llama_kv_cache без групповой раскладки. Сам тест
+    # дополнительно проверяет, что структурная ветка исполнилась.
+    llama_build_and_test(test-kv-group-claim.cpp
+        LABEL main
+        ARGS -m "${MODEL_DIR}/llama-dense.gguf"
+             --cache-type-k kvarn5 --cache-type-v kvarn5 -ngl 0
+             --kv-tail-tokens 1024
+    )
+    set_tests_properties(test-kv-group-claim PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
     llama_test(
         test-recurrent-state-rollback
         LABEL main
@@ -437,6 +459,21 @@ if (LLAMA_TESTS_INSTALL)
 endif()
 add_test(NAME test-kvarn WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-kvarn>)
 set_property(TEST test-kvarn PROPERTY LABELS main)
+
+# Ширина тайла строк запроса читается из GGML_KVARN_Q_TILE один раз на процесс,
+# поэтому перебрать её внутри одного прогона нельзя. На формах основной матрицы
+# оценка кандидатов всегда выбирает тайл 1 (n_kv = 1024 даёт одну волну), так
+# что без этих двух записей ядра с Q_TILE 2 и 3 не исполняются ни одним тестом.
+# При заданной переменной test-kvarn выполняет только матрицу split-декода:
+# однотокенные формы остального набора при принудительном широком тайле
+# законно уходят на generic MMA.
+foreach (KVARN_Q_TILE 2 3)
+    add_test(NAME test-kvarn-q-tile-${KVARN_Q_TILE}
+             WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-kvarn>)
+    set_property(TEST test-kvarn-q-tile-${KVARN_Q_TILE} PROPERTY LABELS main)
+    set_property(TEST test-kvarn-q-tile-${KVARN_Q_TILE} PROPERTY
+                 ENVIRONMENT GGML_KVARN_Q_TILE=${KVARN_Q_TILE})
+endforeach()
 
 llama_build_and_test(test-adaptive-dm.cpp)
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
