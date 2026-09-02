@@ -22,8 +22,10 @@
 #include <cinttypes>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <filesystem>
 #include <random>
+#include <thread>
 #include <utility>
 #include <fstream>
 
@@ -247,6 +249,8 @@ struct server_slot {
     // multimodal
     mtmd_context * mctx = nullptr;
     mtmd::batch_ptr mbatch = nullptr;
+    std::thread mmproj_async_thread; // background thread for async mmproj encoding
+    bool mmproj_async_launched = false; // set once the async encode thread has been launched for the current task; cleared in reset()
 
     // speculative decoding
     common_speculative * spec;
@@ -368,6 +372,12 @@ struct server_slot {
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
+
+        // ensure async mmproj thread is stopped before resetting state
+        if (mmproj_async_thread.joinable()) {
+            mmproj_async_thread.join();
+        }
+        mmproj_async_launched = false;
 
         spec_is_replay = false;
 
@@ -734,12 +744,63 @@ struct server_slot {
     }
 };
 
+// Pre-encode the not-yet-cached media chunks of the prompt into the slot's mbatch.
+// Called from a background thread to overlap mmproj encoding with text prefill.
+// `start_idx` is the first unprocessed token index (n_past at launch time); it is captured
+// by the caller on the main thread because slot.prompt advances concurrently while this runs.
+// Chunks fully before start_idx are already in the KV cache and must not be re-encoded.
+// After this completes, process_mtmd_chunk will find the batch already encoded
+// and only perform the LLM decode of image embeddings.
+static void pre_encode_mtmd_chunks(server_slot & slot, size_t start_idx, std::mutex & encode_mtx) {
+    const auto & mctx = slot.mctx;
+    const auto & input_tokens = slot.task->tokens;
+
+    slot.mbatch.reset(mtmd_batch_init(mctx));
+    if (!slot.mbatch) {
+        SLT_WRN(slot, "mmproj-async: failed to init batch (mctx = %p)\n", (const void *) mctx);
+        return;
+    }
+
+    // find_next_media_chunk() uses upper_bound, so seed with (start_idx - 1) to include a
+    // chunk whose start index equals start_idx exactly
+    size_t idx = (start_idx > 0) ? start_idx - 1 : 0;
+    int n_added = 0;
+    while (true) {
+        auto [chunk, next_idx] = input_tokens.find_next_media_chunk(idx);
+        if (chunk == nullptr) {
+            break;
+        }
+        int32_t res = mtmd_batch_add_chunk(slot.mbatch.get(), chunk->get());
+        if (res != 0) {
+            // batch is full, encode what we have and start a new one
+            // for v1 we just encode and stop (single-batch assumption)
+            break;
+        }
+        n_added++;
+        idx = next_idx;
+    }
+
+    if (n_added > 0) {
+        SLT_TRC(slot, "mmproj-async: encoding %d media chunks in background (start_idx = %zu)\n", n_added, start_idx);
+        // mctx is shared across all slots; serialize with the other encode paths
+        // (other slots' async threads and the sync fallback in process_mtmd_chunk)
+        std::lock_guard<std::mutex> lock(encode_mtx);
+        int32_t res = mtmd_batch_encode(slot.mbatch.get());
+        if (res != 0) {
+            SLT_ERR(slot, "mmproj-async: failed to encode mtmd batch, res = %d\n", res);
+            slot.mbatch.reset();
+        }
+    } else {
+        slot.mbatch.reset();
+    }
+}
+
 // returns 0 on success
 // caller need to update prompt.tokens after a successful call to keep track of the processing progress
 // note: this is not a member of server_slot because we want to run it inside yield_to_queue
 //       slot is passed as const to avoid accidental modification of the slot state
 //       some pointers are allowed to be used, they are not used by to_json()
-static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out) {
+static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out, std::mutex & encode_mtx) {
     GGML_ASSERT(slot.mctx);
     const auto & mctx = slot.mctx;
     const auto & input_tokens = slot.task->tokens;
@@ -817,6 +878,8 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
+    // mctx is shared across all slots; serialize with the async encode threads
+    std::lock_guard<std::mutex> lock(encode_mtx);
     res = mtmd_batch_encode(mbatch.get());
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
@@ -840,6 +903,10 @@ public:
     llama_model * model_tgt = nullptr;
 
     mtmd_context * mctx = nullptr;
+    // serializes mtmd_batch_encode() calls: mctx (and the clip ggml context/sched inside it) is
+    // shared by all slots, while async encode threads and the sync fallback path may encode concurrently
+    std::mutex mmproj_encode_mtx;
+    bool mmproj_async_enabled = false; // resolved at init time
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
     const llama_vocab * vocab = nullptr;
@@ -936,6 +1003,15 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // stop any in-flight async mmproj encode threads before freeing the
+        // contexts they use (mctx / llama_init); a joinable std::thread would
+        // also std::terminate() when the slot is destroyed
+        for (auto & slot : slots) {
+            if (slot.mmproj_async_thread.joinable()) {
+                slot.mmproj_async_thread.join();
+            }
+        }
+
         spec.reset();
         spec_init.reset();
 
@@ -1179,6 +1255,68 @@ private:
             if (params_base.n_cache_reuse) {
                 params_base.n_cache_reuse = 0;
                 SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
+            }
+        }
+
+        // resolve mmproj-async mode
+        if (has_mmproj) {
+            switch (params_base.mmproj_async) {
+                case common_params::mmproj_async_mode::ON:
+                    mmproj_async_enabled = true;
+                    break;
+                case common_params::mmproj_async_mode::AUTO: {
+                    // resolve the default GPU device, mirroring the backend selection in clip.cpp
+                    ggml_backend_dev_t default_gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+                    if (default_gpu == nullptr) {
+                        default_gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+                    }
+
+                    // resolve the mmproj's actual device (nullptr = CPU)
+                    ggml_backend_dev_t mmproj_dev = nullptr;
+                    if (params_base.mmproj_use_gpu) {
+                        mmproj_dev = params_base.mmproj_device != nullptr ? params_base.mmproj_device : default_gpu;
+                    }
+
+                    // resolve the main model's actual GPU device set (empty = CPU-only model)
+                    std::vector<ggml_backend_dev_t> model_gpus;
+                    if (params_base.n_gpu_layers != 0) {
+                        if (!params_base.devices.empty()) {
+                            for (const auto & dev : params_base.devices) {
+                                if (dev == nullptr) {
+                                    continue;
+                                }
+                                const auto dev_type = ggml_backend_dev_type(dev);
+                                if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                                    model_gpus.push_back(dev);
+                                }
+                            }
+                        } else if (default_gpu != nullptr) {
+                            // no explicit device list: the model offloads to the default GPU
+                            model_gpus.push_back(default_gpu);
+                        }
+                    }
+
+                    // enable async only when the mmproj device differs from the main model devices:
+                    //  - CPU mmproj counts as different only when the model runs on a GPU
+                    //  - a GPU mmproj must not be one of the model's GPU devices
+                    mmproj_async_enabled = mmproj_dev == nullptr
+                        ? !model_gpus.empty()
+                        : std::find(model_gpus.begin(), model_gpus.end(), mmproj_dev) == model_gpus.end();
+                    break;
+                }
+                case common_params::mmproj_async_mode::OFF:
+                default:
+                    mmproj_async_enabled = false;
+                    break;
+            }
+            if (mmproj_async_enabled) {
+                const char * mode_str = "off";
+                switch (params_base.mmproj_async) {
+                    case common_params::mmproj_async_mode::ON:   mode_str = "on";   break;
+                    case common_params::mmproj_async_mode::AUTO: mode_str = "auto"; break;
+                    default: break;
+                }
+                SRV_INF("mmproj-async enabled (mode = %s)\n", mode_str);
             }
         }
 
@@ -3425,6 +3563,32 @@ private:
                         }
                     } // end of SLOT_STATE_STARTED
 
+                    // launch async mmproj encoding if enabled and there are media chunks ahead
+                    // note: launched at most once per task (mmproj_async_launched is cleared in reset(),
+                    //       which joins the thread first); the join happens later, when the prompt
+                    //       actually reaches a media chunk, so text prefill can overlap with encoding
+                    if (mmproj_async_enabled && slot.mctx && !slot.mmproj_async_launched) {
+                        // check if there are any media chunks in the remaining prompt
+                        size_t scan_idx = slot.prompt.n_tokens();
+                        bool has_media_ahead = false;
+                        while (scan_idx < slot.task->n_tokens()) {
+                            if (input_tokens[scan_idx] == LLAMA_TOKEN_NULL) {
+                                has_media_ahead = true;
+                                break;
+                            }
+                            scan_idx++;
+                        }
+                        if (has_media_ahead) {
+                            SLT_TRC(slot, "mmproj-async: launching background encode thread (media found at token %d)\n", (int) scan_idx);
+                            slot.mmproj_async_launched = true;
+                            // capture on the main thread: slot.prompt advances concurrently while the thread runs
+                            const size_t start_idx = slot.prompt.n_tokens();
+                            slot.mmproj_async_thread = std::thread([&slot, start_idx, this]() {
+                                pre_encode_mtmd_chunks(slot, start_idx, mmproj_encode_mtx);
+                            });
+                        }
+                    }
+
                     if (!slot.can_split()) {
                         // cannot fit the prompt in the current batch - will try next iter
                         if (batch.size() + slot.task->n_tokens() > n_batch) {
@@ -3484,6 +3648,13 @@ private:
                             break;
                         }
 
+                        // wait for async mmproj encoding to complete before processing media;
+                        // encoding usually finishes during text prefill, so this returns immediately
+                        if (slot.mmproj_async_thread.joinable()) {
+                            SLT_TRC(slot, "mmproj-async: joining background encode thread (n_prompt = %d)\n", slot.prompt.n_tokens());
+                            slot.mmproj_async_thread.join();
+                        }
+
                         // process the mtmd chunk
                         // note: it submits its own decode, potentially be async
                         //       so the timing is queued and flushed on the next sync
@@ -3493,7 +3664,7 @@ private:
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
                         queue_tasks.yield_to_queue([&]() {
-                            res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
+                            res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out, mmproj_encode_mtx);
                         });
 
                         if (res != 0) {
