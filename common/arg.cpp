@@ -2874,6 +2874,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("MTMD_BACKEND_DEVICE")); // no LLAMA_ARG_ prefix for backward compatibility reason
     add_opt(common_arg(
+        {"--mmproj-async"}, "MODE",
+        "async mmproj encoding: true, false, or auto (default: false)\n"
+        "auto enables async when mmproj device differs from main model devices",
+        [](common_params & params, const std::string & value) {
+            if (value == "true" || value == "1" || value == "on") {
+                params.mmproj_async = common_params::mmproj_async_mode::ON;
+            } else if (value == "false" || value == "0" || value == "off") {
+                params.mmproj_async = common_params::mmproj_async_mode::OFF;
+            } else if (value == "auto") {
+                params.mmproj_async = common_params::mmproj_async_mode::AUTO;
+            } else {
+                throw std::invalid_argument("mmproj-async must be true, false, or auto");
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MMPROJ_ASYNC"));
+    add_opt(common_arg(
         {"--image", "--audio", "--video"}, "FILE",
         "path to an image, audio, or video file. use with multimodal models, use comma-separated values for multiple files\n",
         [](common_params & params, const std::string & value) {
