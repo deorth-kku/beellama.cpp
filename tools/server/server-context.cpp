@@ -20,7 +20,10 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <condition_variable>
+#include <deque>
 #include <exception>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <filesystem>
@@ -238,6 +241,35 @@ struct server_batch {
     }
 };
 
+// async mmproj encode pipeline (see --mmproj-async):
+// a "task" is one packed mtmd batch. All not-yet-cached media chunks of the prompt are
+// packed into batches at prefill start and submitted to a single worker thread, which
+// executes them strictly in submission order (mctx is shared across slots and is not
+// thread-safe, so encodes must be serialized anyway). The main thread waits per-batch
+// via futures when the prompt reaches the first chunk of each batch, so the LLM decode
+// of one image overlaps with the encoding of the next one.
+
+// job consumed by the worker thread
+struct mmproj_encode_job {
+    mtmd_batch * batch; // non-owning; ownership stays in server_slot::mbatch_queue
+    std::promise<int32_t> result; // fulfilled by the worker with the encode result code
+};
+
+// worker thread + FIFO job queue (heap-allocated per task; server_slot must stay movable)
+struct mmproj_async_worker {
+    std::thread thread;
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::deque<mmproj_encode_job> jobs;
+    bool stop = false;
+};
+
+// a packed batch queued for the LLM decode, bound to its completion future
+struct mmproj_batch_entry {
+    mtmd::batch_ptr batch; // owned
+    std::future<int32_t> enc; // resolves when the worker finished encoding this batch
+};
+
 struct server_slot {
     int id;
 
@@ -248,9 +280,11 @@ struct server_slot {
 
     // multimodal
     mtmd_context * mctx = nullptr;
-    mtmd::batch_ptr mbatch = nullptr;
-    std::thread mmproj_async_thread; // background thread for async mmproj encoding
-    bool mmproj_async_launched = false; // set once the async encode thread has been launched for the current task; cleared in reset()
+    // async mmproj encode pipeline: batches in chunk order (front = earliest not yet
+    // consumed); each entry's future resolves when the worker encoded the batch
+    std::deque<mmproj_batch_entry> mbatch_queue;
+    std::unique_ptr<mmproj_async_worker> mmproj_async; // background encode worker (thread + FIFO job queue)
+    bool mmproj_async_launched = false; // set once the batches were submitted for the current task; cleared in reset()
 
     // speculative decoding
     common_speculative * spec;
@@ -370,13 +404,35 @@ struct server_slot {
     int64_t t_print_last = 0;
     int32_t n_gen_last = 0;
 
+    // stop the async mmproj encode worker (if running) and wait for it to exit.
+    // Any jobs left in the queue are dropped: at this point the main thread no longer
+    // waits on their futures (the slot is being reset or destroyed), so the unfulfilled
+    // promises are destroyed without waiters.
+    // note: must be called before mctx is freed (the worker uses it to encode)
+    void mmproj_async_stop_and_join() {
+        if (!mmproj_async) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mmproj_async->mtx);
+            mmproj_async->stop = true;
+        }
+        mmproj_async->cv.notify_all();
+        if (mmproj_async->thread.joinable()) {
+            mmproj_async->thread.join();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mmproj_async->mtx);
+            mmproj_async->jobs.clear();
+        }
+        mmproj_async.reset();
+    }
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
-        // ensure async mmproj thread is stopped before resetting state
-        if (mmproj_async_thread.joinable()) {
-            mmproj_async_thread.join();
-        }
+        // ensure the async mmproj worker is stopped before resetting state
+        mmproj_async_stop_and_join();
         mmproj_async_launched = false;
 
         spec_is_replay = false;
@@ -413,7 +469,7 @@ struct server_slot {
         alora_invocation_start = -1;
 
         // clear multimodal state
-        mbatch.reset();
+        mbatch_queue.clear();
     }
 
     void init_sampler() const {
@@ -744,63 +800,112 @@ struct server_slot {
     }
 };
 
-// Pre-encode the not-yet-cached media chunks of the prompt into the slot's mbatch.
-// Called from a background thread to overlap mmproj encoding with text prefill.
-// `start_idx` is the first unprocessed token index (n_past at launch time); it is captured
-// by the caller on the main thread because slot.prompt advances concurrently while this runs.
-// Chunks fully before start_idx are already in the KV cache and must not be re-encoded.
-// After this completes, process_mtmd_chunk will find the batch already encoded
-// and only perform the LLM decode of image embeddings.
-static void pre_encode_mtmd_chunks(server_slot & slot, size_t start_idx, std::mutex & encode_mtx) {
+// Submit one packed batch to the async worker: queue it for the LLM decode (batches stay
+// in chunk order, front to back) and enqueue a job so the worker encodes it in submission
+// order. Ownership of the batch moves into slot.mbatch_queue; the job only carries a raw
+// pointer that is valid until the batch entry is popped, which happens only after the
+// future resolves, i.e. after the worker is done with the batch.
+static void mmproj_async_submit_job(server_slot & slot, mtmd::batch_ptr & batch) {
+    mmproj_batch_entry entry;
+    mmproj_encode_job job;
+    job.batch = batch.get();
+    entry.enc = job.result.get_future();
+    entry.batch = std::move(batch);
+    slot.mbatch_queue.push_back(std::move(entry));
+    std::lock_guard<std::mutex> lock(slot.mmproj_async->mtx);
+    slot.mmproj_async->jobs.push_back(std::move(job));
+}
+
+// Worker loop: encode jobs strictly in submission order. mctx is shared across all slots,
+// so every encode is serialized with the other encode paths (other slots' workers and the
+// sync fallback in process_mtmd_chunk) via encode_mtx.
+// On the first encode failure the worker stops taking new jobs; the main thread detects it
+// via the future and falls back to synchronous encoding.
+// Once stop is set the worker exits without draining the queue (at the latest after the
+// current job), so reset()/destroy() and the error fallback are not blocked by encodes
+// whose results will no longer be consumed; the dropped jobs' promises are destroyed
+// waiter-free by mmproj_async_stop_and_join().
+static void mmproj_async_worker_fn(mmproj_async_worker * worker, std::mutex * encode_mtx) {
+    while (true) {
+        mmproj_encode_job job;
+        {
+            std::unique_lock<std::mutex> lock(worker->mtx);
+            worker->cv.wait(lock, [&]() { return worker->stop || !worker->jobs.empty(); });
+            if (worker->stop) {
+                break;
+            }
+            job = std::move(worker->jobs.front());
+            worker->jobs.pop_front();
+        }
+        int32_t res = 0;
+        {
+            std::lock_guard<std::mutex> lock(*encode_mtx);
+            res = mtmd_batch_encode(job.batch);
+        }
+        job.result.set_value(res);
+        if (res != 0) {
+            std::lock_guard<std::mutex> lock(worker->mtx);
+            worker->stop = true;
+        }
+    }
+}
+
+// Pack all not-yet-cached media chunks of the prompt into batches and submit them to the
+// async worker, then start the worker. Called on the main thread at prefill start so that
+// all encoding begins as early as possible: batch k+1 is encoded right after batch k
+// finishes, regardless of how far the text prefill has progressed.
+// `start_idx` is the first unprocessed token index (n_past at launch time); chunks fully
+// before start_idx are already in the KV cache and must not be re-encoded.
+static void mmproj_async_launch(server_slot & slot, size_t start_idx, std::mutex & encode_mtx) {
     const auto & mctx = slot.mctx;
     const auto & input_tokens = slot.task->tokens;
 
-    slot.mbatch.reset(mtmd_batch_init(mctx));
-    if (!slot.mbatch) {
-        SLT_WRN(slot, "mmproj-async: failed to init batch (mctx = %p)\n", (const void *) mctx);
-        return;
-    }
+    slot.mmproj_async = std::make_unique<mmproj_async_worker>();
 
-    // find_next_media_chunk() uses upper_bound, so seed with (start_idx - 1) to include a
-    // chunk whose start index equals start_idx exactly
-    size_t idx = (start_idx > 0) ? start_idx - 1 : 0;
-    int n_added = 0;
+    // find_first_media_chunk() uses lower_bound, so seed with start_idx itself to include a
+    // chunk whose start index equals start_idx exactly (including start_idx == 0)
+    size_t idx = start_idx;
+    int n_chunks = 0;
+    int n_batches = 0;
+    mtmd::batch_ptr cur = nullptr;
     while (true) {
-        auto [chunk, next_idx] = input_tokens.find_next_media_chunk(idx);
+        auto [chunk, chunk_idx] = input_tokens.find_first_media_chunk(idx);
         if (chunk == nullptr) {
             break;
         }
-        int32_t res = mtmd_batch_add_chunk(slot.mbatch.get(), chunk->get());
-        if (res != 0) {
-            // batch is full, encode what we have and start a new one
-            // for v1 we just encode and stop (single-batch assumption)
-            break;
+        int32_t res = cur ? mtmd_batch_add_chunk(cur.get(), chunk->get()) : 0;
+        if (!cur || res != 0) {
+            // the current batch cannot take this chunk (too large or not batchable with it):
+            // submit it and start a new one; the first chunk always fits a fresh batch
+            if (cur) {
+                mmproj_async_submit_job(slot, cur);
+                n_batches++;
+            }
+            cur = mtmd::batch_ptr(mtmd_batch_init(mctx));
+            GGML_ASSERT(cur && mtmd_batch_add_chunk(cur.get(), chunk->get()) == 0);
         }
-        n_added++;
-        idx = next_idx;
+        n_chunks++;
+        // advance past this chunk: find_first_media_chunk() returns the chunk's start index,
+        // so re-seeding the search with it would find the same chunk again
+        idx = chunk_idx + mtmd_input_chunk_get_n_tokens(chunk->get());
     }
+    if (cur) {
+        mmproj_async_submit_job(slot, cur);
+        n_batches++;
+    }
+    GGML_ASSERT(n_batches > 0);
 
-    if (n_added > 0) {
-        SLT_TRC(slot, "mmproj-async: encoding %d media chunks in background (start_idx = %zu)\n", n_added, start_idx);
-        // mctx is shared across all slots; serialize with the other encode paths
-        // (other slots' async threads and the sync fallback in process_mtmd_chunk)
-        std::lock_guard<std::mutex> lock(encode_mtx);
-        int32_t res = mtmd_batch_encode(slot.mbatch.get());
-        if (res != 0) {
-            SLT_ERR(slot, "mmproj-async: failed to encode mtmd batch, res = %d\n", res);
-            slot.mbatch.reset();
-        }
-    } else {
-        slot.mbatch.reset();
-    }
+    SLT_TRC(slot, "mmproj-async: submitted %d media chunks in %d batches to the background worker (start_idx = %zu)\n",
+            n_chunks, n_batches, start_idx);
+    slot.mmproj_async->thread = std::thread(mmproj_async_worker_fn, slot.mmproj_async.get(), &encode_mtx);
 }
 
 // returns 0 on success
 // caller need to update prompt.tokens after a successful call to keep track of the processing progress
 // note: this is not a member of server_slot because we want to run it inside yield_to_queue
-//       slot is passed as const to avoid accidental modification of the slot state
-//       some pointers are allowed to be used, they are not used by to_json()
-static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out, std::mutex & encode_mtx) {
+//       the slot is passed by reference because the batch queue is updated here:
+//       batches are popped once fully consumed and pushed by the sync fallback
+static int process_mtmd_chunk(server_slot & slot, size_t idx, size_t & n_tokens_out, std::mutex & encode_mtx) {
     GGML_ASSERT(slot.mctx);
     const auto & mctx = slot.mctx;
     const auto & input_tokens = slot.task->tokens;
@@ -808,43 +913,59 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
     int32_t res = 0;
 
     auto try_decode = [&]() -> int32_t {
-        if (mbatch) {
-            float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
-            if (embd) {
-                void * cb_data = slot.spec;
-                static auto cb = [](llama_batch batch, void * user_data) {
-                    common_speculative * spec = static_cast<common_speculative *>(user_data);
-                    if (!common_speculative_process(spec, batch)) {
-                        return 1;
-                    }
-                    return 0;
-                };
-
-                llama_pos new_n_past; // unused for now
-                res = mtmd_helper_decode_image_chunk(
-                    mctx,
-                    slot.ctx_tgt,
-                    chunk.get(),
-                    embd,
-                    slot.prompt.tokens.pos_next(),
-                    slot.id,
-                    llama_n_batch(slot.ctx_tgt),
-                    &new_n_past,
-                    cb,
-                    cb_data
-                );
-                if (res != 0) {
-                    SLT_ERR(slot, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
-                    return -1;
-                }
-                n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
-                return 0; // success
-            }
+        if (slot.mbatch_queue.empty()) {
+            return 1; // (non-error) need to create & encode batch
         }
-        return 1; // (non-error) need to create & encode batch
+        auto & entry = slot.mbatch_queue.front();
+        float * embd = mtmd_batch_get_output_embd(entry.batch.get(), chunk.get());
+        if (embd == nullptr) {
+            // unreachable: the front batch must contain the current chunk, because batches
+            // partition the media chunks in order and are popped only after their last
+            // chunk has been decoded
+            SLT_ERR(slot, "internal error: front mmproj batch does not contain chunk idx = %zu\n", idx);
+            return -1;
+        }
+        {
+            void * cb_data = slot.spec;
+            static auto cb = [](llama_batch batch, void * user_data) {
+                common_speculative * spec = static_cast<common_speculative *>(user_data);
+                if (!common_speculative_process(spec, batch)) {
+                    return 1;
+                }
+                return 0;
+            };
+
+            llama_pos new_n_past; // unused for now
+            res = mtmd_helper_decode_image_chunk(
+                mctx,
+                slot.ctx_tgt,
+                chunk.get(),
+                embd,
+                slot.prompt.tokens.pos_next(),
+                slot.id,
+                llama_n_batch(slot.ctx_tgt),
+                &new_n_past,
+                cb,
+                cb_data
+            );
+        }
+        if (res != 0) {
+            SLT_ERR(slot, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
+            return -1;
+        }
+        n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
+
+        // release the batch once its last chunk has been decoded
+        auto [next_chunk, next_idx] = input_tokens.find_next_media_chunk(idx);
+        const bool exhausted = next_chunk == nullptr ||
+                mtmd_batch_get_output_embd(entry.batch.get(), next_chunk->get()) == nullptr;
+        if (exhausted) {
+            slot.mbatch_queue.pop_front();
+        }
+        return 0; // success
     };
 
-    // if the batch is already exist, try searching & encode
+    // if a pre-encoded batch is available, decode from it
     res = try_decode();
     if (res == 0) {
         return 0;
@@ -854,16 +975,18 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
         return res;
     }
 
-    // otherwise, the batch is either uninitialized or is used up
-    // we need to create & encode a new batch
-    mbatch.reset(mtmd_batch_init(mctx));
+    // otherwise, no pre-encoded batch is available for this chunk
+    // (async encoding disabled, or the worker failed): create & encode a new batch now
+    GGML_ASSERT(slot.mbatch_queue.empty());
+    auto mbatch = mtmd::batch_ptr(mtmd_batch_init(mctx));
+    GGML_ASSERT(mbatch);
     res = mtmd_batch_add_chunk(mbatch.get(), chunk.get());
     GGML_ASSERT(res == 0); // we should never have an empty batch
 
     // try batching as much as possible
     int n_added = 1;
     size_t idx_cur = idx;
-    while (res == 0) {
+    while (true) {
         auto [next_chunk, next_idx] = input_tokens.find_next_media_chunk(idx_cur);
         if (next_chunk == nullptr) {
             break;
@@ -872,18 +995,33 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
         n_added += (res == 0 ? 1 : 0);
         idx_cur = next_idx;
         SLT_DBG(slot, "try adding media chunk idx = %zu to batch, res = %d\n", next_idx, res);
-        // if res != 0, batch is full or chunk is not compatible -> this loop breaks
+        if (res != 0) {
+            break; // batch is full or chunk is not compatible
+        }
     }
 
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
-    // mctx is shared across all slots; serialize with the async encode threads
-    std::lock_guard<std::mutex> lock(encode_mtx);
-    res = mtmd_batch_encode(mbatch.get());
+    // mctx is shared across all slots; serialize with the async encode workers
+    {
+        std::lock_guard<std::mutex> lock(encode_mtx);
+        res = mtmd_batch_encode(mbatch.get());
+    }
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
         return -1;
+    }
+
+    // queue the encoded batch (with an already-resolved future) so that the chunks batched
+    // ahead of the current one are decoded from it in the following iterations
+    {
+        mmproj_batch_entry entry;
+        std::promise<int32_t> pr;
+        entry.enc = pr.get_future();
+        pr.set_value(0);
+        entry.batch = std::move(mbatch);
+        slot.mbatch_queue.push_back(std::move(entry));
     }
 
     return try_decode();
@@ -1003,13 +1141,11 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
-        // stop any in-flight async mmproj encode threads before freeing the
+        // stop any in-flight async mmproj encode workers before freeing the
         // contexts they use (mctx / llama_init); a joinable std::thread would
         // also std::terminate() when the slot is destroyed
         for (auto & slot : slots) {
-            if (slot.mmproj_async_thread.joinable()) {
-                slot.mmproj_async_thread.join();
-            }
+            slot.mmproj_async_stop_and_join();
         }
 
         spec.reset();
@@ -3563,29 +3699,21 @@ private:
                         }
                     } // end of SLOT_STATE_STARTED
 
-                    // launch async mmproj encoding if enabled and there are media chunks ahead
-                    // note: launched at most once per task (mmproj_async_launched is cleared in reset(),
-                    //       which joins the thread first); the join happens later, when the prompt
-                    //       actually reaches a media chunk, so text prefill can overlap with encoding
+                    // submit all remaining media chunks to the async encode worker if enabled
+                    // note: submitted at most once per task (mmproj_async_launched is cleared in reset(),
+                    //       which stops and joins the worker first); the main thread waits per-batch
+                    //       via futures when the prompt actually reaches a media chunk, so text
+                    //       prefill can overlap with encoding
                     if (mmproj_async_enabled && slot.mctx && !slot.mmproj_async_launched) {
-                        // check if there are any media chunks in the remaining prompt
-                        size_t scan_idx = slot.prompt.n_tokens();
-                        bool has_media_ahead = false;
-                        while (scan_idx < slot.task->n_tokens()) {
-                            if (input_tokens[scan_idx] == LLAMA_TOKEN_NULL) {
-                                has_media_ahead = true;
-                                break;
-                            }
-                            scan_idx++;
-                        }
+                        // check if there are any media chunks in the remaining prompt;
+                        // same predicate as the packing in mmproj_async_launch, so launch
+                        // only fires when there is at least one chunk to pack
+                        const size_t scan_idx = slot.prompt.n_tokens();
+                        const bool has_media_ahead = input_tokens.find_first_media_chunk(scan_idx).first != nullptr;
                         if (has_media_ahead) {
-                            SLT_TRC(slot, "mmproj-async: launching background encode thread (media found at token %d)\n", (int) scan_idx);
                             slot.mmproj_async_launched = true;
-                            // capture on the main thread: slot.prompt advances concurrently while the thread runs
                             const size_t start_idx = slot.prompt.n_tokens();
-                            slot.mmproj_async_thread = std::thread([&slot, start_idx, this]() {
-                                pre_encode_mtmd_chunks(slot, start_idx, mmproj_encode_mtx);
-                            });
+                            mmproj_async_launch(slot, start_idx, mmproj_encode_mtx);
                         }
                     }
 
@@ -3648,23 +3776,29 @@ private:
                             break;
                         }
 
-                        // wait for async mmproj encoding to complete before processing media;
-                        // encoding usually finishes during text prefill, so this returns immediately
-                        if (slot.mmproj_async_thread.joinable()) {
-                            SLT_TRC(slot, "mmproj-async: joining background encode thread (n_prompt = %d)\n", slot.prompt.n_tokens());
-                            slot.mmproj_async_thread.join();
-                        }
-
-                        // process the mtmd chunk
-                        // note: it submits its own decode, potentially be async
-                        //       so the timing is queued and flushed on the next sync
+                        // wait for the async worker to finish encoding the batch containing this
+                        // chunk (front of the queue) before decoding it; later batches keep
+                        // encoding in the background while this chunk's LLM decode runs.
+                        // The wait happens inside yield_to_queue so metrics tasks are still
+                        // handled in the meantime.
                         metrics_pre_decode();
-
-                        // encode on the worker thread, so we can still handle metrics tasks
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
                         queue_tasks.yield_to_queue([&]() {
-                            res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out, mmproj_encode_mtx);
+                            if (!slot.mbatch_queue.empty()) {
+                                const int64_t t_wait_start = ggml_time_us();
+                                const int32_t enc_res = slot.mbatch_queue.front().enc.get();
+                                SLT_TRC(slot, "mmproj-async: waited %0.2f ms for the batch containing chunk idx = %zu\n",
+                                        (ggml_time_us() - t_wait_start) / 1000.0, cur_token_idx);
+                                if (enc_res != 0) {
+                                    // the worker failed on this batch: stop it, drop all queued
+                                    // batches and let process_mtmd_chunk fall back to sync encoding
+                                    SLT_ERR(slot, "mmproj-async: background encode failed (res = %d), falling back to sync encode\n", enc_res);
+                                    slot.mmproj_async_stop_and_join();
+                                    slot.mbatch_queue.clear();
+                                }
+                            }
+                            res = process_mtmd_chunk(slot, cur_token_idx, n_tokens_out, mmproj_encode_mtx);
                         });
 
                         if (res != 0) {
