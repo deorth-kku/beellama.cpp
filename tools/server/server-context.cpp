@@ -1266,6 +1266,10 @@ private:
             mparams.image_min_tokens = params_base.image_min_tokens;
             mparams.image_max_tokens = params_base.image_max_tokens;
             mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
+            mparams.embd_cache_max_bytes = (int64_t) params_base.mtmd_embd_cache_mb * 1024 * 1024;
+            if (mparams.embd_cache_max_bytes > 0) {
+                SRV_INF("mmproj embd cache: max %zu MiB\n", (size_t) mparams.embd_cache_max_bytes / (1024 * 1024));
+            }
             mparams.media_marker     = get_media_marker();
             // progress callback
             mparams.progress_callback           = load_progress_callback;
