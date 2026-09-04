@@ -6,6 +6,8 @@
 #include "mtmd-image.h"
 #include "debug/mtmd-debug.h"
 
+#include "hash/hash.h"
+
 #include "llama.h"
 
 // fix problem with std::min and std::max
@@ -23,7 +25,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <list>
+#include <mutex>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 // remember to bump this if the serialization format changes
@@ -416,6 +421,103 @@ struct mtmd_input_chunks {
     std::vector<mtmd_input_chunk> entries;
 };
 
+// per-chunk embd cache: when the same media chunk is encoded again (e.g. the same
+// image sent to different slots), reuse the cached output instead of re-encoding
+struct mtmd_embd_cache {
+    std::mutex mtx;
+    std::list<std::string> lru; // front = least recently used
+    std::unordered_map<std::string, std::vector<float>> data;
+    size_t bytes = 0;
+    const size_t max_bytes;
+
+    explicit mtmd_embd_cache(size_t max_bytes) : max_bytes(max_bytes) {}
+
+    bool enabled() const { return max_bytes > 0; }
+
+    // returns nullptr on miss
+    const std::vector<float> * get(const std::string & key) {
+        auto it = data.find(key);
+        if (it == data.end()) {
+            return nullptr;
+        }
+        lru.erase(std::find(lru.begin(), lru.end(), key));
+        lru.push_back(key);
+        return &it->second;
+    }
+
+    void put(std::string key, std::vector<float> embd) {
+        const size_t new_bytes = embd.size() * sizeof(float);
+        if (new_bytes > max_bytes) {
+            return; // a single entry bigger than the whole cache
+        }
+        auto it = data.find(key);
+        if (it != data.end()) {
+            bytes -= it->second.size() * sizeof(float);
+            lru.erase(std::find(lru.begin(), lru.end(), key));
+            data.erase(it);
+        }
+        while (!lru.empty() && bytes + new_bytes > max_bytes) {
+            auto old = data.find(lru.front());
+            bytes -= old->second.size() * sizeof(float);
+            lru.pop_front();
+            data.erase(old);
+        }
+        auto res = data.emplace(std::move(key), std::move(embd));
+        lru.push_back(res.first->first);
+        bytes += new_bytes;
+    }
+};
+
+// build a cache key from the chunk's actual encoder input
+// note: the chunk id is not sufficient - tiled images (llava-uhd) and merged
+// video frames share the same id while having different content
+static std::string embd_cache_key(const mtmd_input_chunk * chunk) {
+    std::vector<char> key;
+    auto append = [&key](const void * data, size_t len) {
+        const char * p = (const char *) data;
+        key.insert(key.end(), p, p + len);
+    };
+    append(&chunk->type, sizeof(chunk->type));
+    if (chunk->tokens_image) {
+        const auto & t = *chunk->tokens_image;
+        append(&t.nx, sizeof(t.nx));
+        append(&t.ny, sizeof(t.ny));
+        append(&t.pos, sizeof(t.pos));
+        append(&t.image_idx, sizeof(t.image_idx));
+        append(&t.n_temporal_merge, sizeof(t.n_temporal_merge));
+        for (const auto & e : t.batch_f32.entries) {
+            append(&e.add_viewsep, sizeof(e.add_viewsep));
+            append(&e.add_newline, sizeof(e.add_newline));
+            append(&e.lead_pad, sizeof(e.lead_pad));
+            append(&e.anyres.grid_x, sizeof(int));
+            append(&e.anyres.grid_y, sizeof(int));
+            append(&e.anyres.orig_nx, sizeof(int));
+            append(&e.anyres.orig_ny, sizeof(int));
+            const int nx = e.nx();
+            const int ny = e.ny();
+            append(&nx, sizeof(nx));
+            append(&ny, sizeof(ny));
+            const auto & buf = e.get_ro_buf();
+            append(buf.data(), buf.size() * sizeof(float));
+        }
+    } else if (chunk->tokens_audio) {
+        const auto & t = *chunk->tokens_audio;
+        append(&t.n_tokens, sizeof(t.n_tokens));
+        for (const auto & e : t.batch_f32.entries) {
+            const int nx = e.nx();
+            const int ny = e.ny();
+            append(&nx, sizeof(nx));
+            append(&ny, sizeof(ny));
+            const auto & buf = e.get_ro_buf();
+            append(buf.data(), buf.size() * sizeof(float));
+        }
+    } else {
+        LOG_ERR("%s: cannot build embd cache key for a text chunk\n", __func__);
+        return {};
+    }
+    return hash_sha256_hex(key.data(), key.size());
+}
+
 struct mtmd_batch {
     mtmd_context * ctx;
     std::vector<const mtmd_input_chunk *> entries;
@@ -470,6 +572,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* cb_eval           */ nullptr,
         /* cb_eval_user_data */ nullptr,
         /* batch_max_tokens  */ 1024,
+        /* embd_cache_max_bytes */ 0,
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
     };
@@ -525,6 +628,9 @@ struct mtmd_context {
     // batching
     int32_t batch_max_tokens;
 
+    // embd cache
+    mtmd_embd_cache embd_cache;
+
     // TODO @ngxson : add timings
 
     mtmd_context(const char * mmproj_fname,
@@ -536,7 +642,8 @@ struct mtmd_context {
         media_marker    (ctx_params.media_marker),
         n_embd_text     (text_model ? llama_model_n_embd_inp(text_model) : -1),
         vocab           (text_model ? llama_model_get_vocab(text_model) : nullptr),
-        batch_max_tokens(ctx_params.batch_max_tokens)
+        batch_max_tokens(ctx_params.batch_max_tokens),
+        embd_cache(ctx_params.embd_cache_max_bytes > 0 ? (size_t) ctx_params.embd_cache_max_bytes : 0)
     {
         if (ctx_params.image_marker != nullptr) {
             throw std::runtime_error("custom image_marker is not supported anymore, use media_marker instead");
@@ -2098,6 +2205,45 @@ static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
         }
     }
 
+    auto & cache = batch->ctx->embd_cache;
+    std::vector<std::string> keys;
+    if (cache.enabled()) {
+        // try to assemble the output from cached per-chunk embd
+        keys.reserve(batch->entries.size());
+        for (const auto * chunk : batch->entries) {
+            keys.push_back(embd_cache_key(chunk));
+        }
+        const size_t n_embd = (size_t) batch->ctx->n_embd_out();
+        {
+            std::lock_guard<std::mutex> lock(cache.mtx);
+            std::vector<const std::vector<float> *> cached;
+            cached.reserve(keys.size());
+            for (size_t i = 0; i < keys.size(); i++) {
+                const size_t n_expected = mtmd_input_chunk_get_n_tokens(batch->entries[i]) * n_embd;
+                const std::vector<float> * embd = cache.get(keys[i]);
+                if (embd == nullptr || embd->size() != n_expected) {
+                    break;
+                }
+                cached.push_back(embd);
+            }
+            if (cached.size() == keys.size()) {
+                size_t n = 0;
+                for (const auto * embd : cached) {
+                    n += embd->size();
+                }
+                batch->output_embd.resize(n);
+                size_t off = 0;
+                for (const auto * embd : cached) {
+                    std::copy(embd->begin(), embd->end(), batch->output_embd.begin() + off);
+                    off += embd->size();
+                }
+                LOG_INF("%s: embd cache hit, %zu chunks, %zu tokens\n",
+                        __func__, cached.size(), n / n_embd);
+                return 0;
+            }
+        }
+    }
+
     // represent the whole batch as one single chunk
     mtmd::input_chunk_ptr batch_chunk(mtmd_input_chunk_copy(batch->entries[0]));
     if (batch_chunk->tokens_image) {
@@ -2135,6 +2281,28 @@ static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
         batch->ctx,
         batch_chunk.get(),
         batch->output_embd);
+    if (res != 0) {
+        return res;
+    }
+
+    // store the per-chunk results in the cache
+    if (cache.enabled()) {
+        const size_t n_embd = (size_t) batch->ctx->n_embd_out();
+        std::vector<std::vector<float>> embds;
+        embds.reserve(keys.size());
+        size_t off = 0;
+        for (const auto * chunk : batch->entries) {
+            const size_t n = mtmd_input_chunk_get_n_tokens(chunk) * n_embd;
+            // same per-chunk offset invariant as mtmd_batch_get_output_embd
+            GGML_ASSERT(off + n <= batch->output_embd.size());
+            embds.emplace_back(batch->output_embd.begin() + off, batch->output_embd.begin() + off + n);
+            off += n;
+        }
+        std::lock_guard<std::mutex> lock(cache.mtx);
+        for (size_t i = 0; i < keys.size(); i++) {
+            cache.put(std::move(keys[i]), std::move(embds[i]));
+        }
+    }
     return res;
 }
 

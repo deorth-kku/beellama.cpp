@@ -117,6 +117,9 @@ struct mtmd_context_params {
                               // (note: this is not a hard-limit, the first image will always be added even if it exceeds this limit)
                               // (default: 1024)
 
+    // embd cache: max CPU bytes to keep cached mmproj encode results, 0 = disabled
+    int64_t embd_cache_max_bytes;
+
     // Called with a progress value between 0.0 and 1.0. Pass NULL to disable.
     // If the provided progress_callback returns true, model loading continues.
     // If it returns false, model loading is immediately aborted.
