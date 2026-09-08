@@ -127,6 +127,10 @@ struct llama_file::impl {
         }
     }
 
+    void flush() const {
+        // all IO goes through the handle, nothing is buffered in the FILE* stream
+    }
+
     void read_raw(void * ptr, size_t len) {
         size_t bytes_read = 0;
         while (bytes_read < len) {
@@ -141,6 +145,51 @@ struct llama_file::impl {
             }
 
             bytes_read += chunk_read;
+        }
+    }
+
+    // the offset fields of the OVERLAPPED structure position a synchronous read on a non-overlapped handle
+    void read_at(void * ptr, size_t len, size_t offset) const {
+        size_t bytes_read = 0;
+        while (bytes_read < len) {
+            size_t chunk_size = std::min<size_t>(len - bytes_read, 64*1024*1024);
+            DWORD chunk_read = 0;
+
+            OVERLAPPED ov {};
+            ov.Offset     = (offset + bytes_read) & 0xFFFFFFFF;
+            ov.OffsetHigh = (offset + bytes_read) >> 32;
+
+            BOOL result = ReadFile(fp_win32, reinterpret_cast<char*>(ptr) + bytes_read, chunk_size, &chunk_read, &ov);
+            if (!result) {
+                throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+            }
+            if (chunk_read < chunk_size || chunk_read == 0) {
+                throw std::runtime_error("unexpectedly reached end of file");
+            }
+
+            bytes_read += chunk_read;
+        }
+    }
+
+    void write_at(const void * ptr, size_t len, size_t offset) const {
+        size_t bytes_written = 0;
+        while (bytes_written < len) {
+            size_t chunk_size = std::min<size_t>(len - bytes_written, 64*1024*1024);
+            DWORD chunk_written = 0;
+
+            OVERLAPPED ov {};
+            ov.Offset     = (offset + bytes_written) & 0xFFFFFFFF;
+            ov.OffsetHigh = (offset + bytes_written) >> 32;
+
+            BOOL result = WriteFile(fp_win32, reinterpret_cast<char const*>(ptr) + bytes_written, chunk_size, &chunk_written, &ov);
+            if (!result) {
+                throw std::runtime_error(format("write error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+            }
+            if (chunk_written < chunk_size || chunk_written == 0) {
+                throw std::runtime_error("unexpectedly failed to write bytes");
+            }
+
+            bytes_written += chunk_written;
         }
     }
 
@@ -262,6 +311,14 @@ struct llama_file::impl {
         }
     }
 
+    void flush() const {
+        if (fd == -1) {
+            if (std::fflush(fp) != 0) {
+                throw std::runtime_error(format("flush error: %s", strerror(errno)));
+            }
+        }
+    }
+
     void read_raw_unsafe(void * ptr, size_t len) {
         if (len == 0) {
             return;
@@ -349,6 +406,103 @@ struct llama_file::impl {
         }
     }
 
+    void read_at(void * ptr, size_t len, size_t offset) const {
+        if (len == 0) {
+            return;
+        }
+        if (has_direct_io()) {
+            // O_DIRECT requires aligned offset, buffer, and length
+            off_t aligned_offset = offset & ~(alignment - 1);
+            off_t offset_from_alignment = offset - aligned_offset;
+            size_t bytes_to_read = (offset_from_alignment + len + alignment - 1) & ~(alignment - 1);
+
+            void * raw_buffer = nullptr;
+            int ret = posix_memalign(&raw_buffer, alignment, bytes_to_read);
+            if (ret != 0) {
+                throw std::runtime_error(format("posix_memalign failed with error %d", ret));
+            }
+
+            struct aligned_buffer_deleter {
+                void operator()(void * p) const { free(p); }
+            };
+            std::unique_ptr<void, aligned_buffer_deleter> buffer(raw_buffer);
+
+            errno = 0;
+            ssize_t n_read = pread(fd, buffer.get(), bytes_to_read, aligned_offset);
+            if (n_read == -1) {
+                // no fallback to buffered IO here, as the fd state is shared with other threads
+                throw std::runtime_error(format("read error: %s", strerror(errno)));
+            }
+            // the aligned read may extend past the end of the file, allow it if the requested data was fully read
+            if ((size_t) n_read < bytes_to_read) {
+                if ((size_t) n_read < offset_from_alignment + len) {
+                    throw std::runtime_error("unexpectedly reached end of file");
+                }
+                std::memset(reinterpret_cast<char *>(buffer.get()) + n_read, 0, bytes_to_read - n_read);
+            }
+
+            memcpy(ptr, reinterpret_cast<char *>(buffer.get()) + offset_from_alignment, len);
+        } else {
+            int f;
+#if defined(fileno)
+            f = fileno(fp);
+#else
+            f = ::fileno(fp);
+#endif
+
+            size_t bytes_read = 0;
+            while (bytes_read < len) {
+                errno = 0;
+                ssize_t n_read = pread(f, reinterpret_cast<char *>(ptr) + bytes_read, len - bytes_read, offset + bytes_read);
+                if (n_read == -1) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    throw std::runtime_error(format("read error: %s", strerror(errno)));
+                }
+                if (n_read == 0) {
+                    throw std::runtime_error("unexpectedly reached end of file");
+                }
+
+                bytes_read += (size_t) n_read;
+            }
+        }
+    }
+
+    void write_at(const void * ptr, size_t len, size_t offset) const {
+        if (len == 0) {
+            return;
+        }
+
+        int f;
+        if (fd != -1) {
+            f = fd;
+        } else {
+#if defined(fileno)
+            f = fileno(fp);
+#else
+            f = ::fileno(fp);
+#endif
+        }
+
+        size_t bytes_written = 0;
+        while (bytes_written < len) {
+            errno = 0;
+            ssize_t n_written = pwrite(f, reinterpret_cast<const char *>(ptr) + bytes_written, len - bytes_written, offset + bytes_written);
+            if (n_written == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw std::runtime_error(format("write error: %s", strerror(errno)));
+            }
+            if (n_written == 0) {
+                throw std::runtime_error("unexpectedly failed to write bytes");
+            }
+
+            bytes_written += (size_t) n_written;
+        }
+    }
+
     uint32_t read_u32() {
         uint32_t ret;
         read_raw(&ret, sizeof(ret));
@@ -425,6 +579,7 @@ int llama_file::file_id() const {
 }
 
 void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
+void llama_file::flush() const { pimpl->flush(); }
 void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
 #ifdef _WIN32
 void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
@@ -433,6 +588,9 @@ void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsaf
 #endif
 
 uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
+
+void llama_file::read_at(void * ptr, size_t len, size_t offset) const { pimpl->read_at(ptr, len, offset); }
+void llama_file::write_at(const void * ptr, size_t len, size_t offset) const { pimpl->write_at(ptr, len, offset); }
 
 void llama_file::write_raw(const void * ptr, size_t len) const { pimpl->write_raw(ptr, len); }
 void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }

@@ -26,10 +26,17 @@ struct llama_file {
 
     void seek(size_t offset, int whence) const;
 
+    // flush buffered writes to the file, no-op for handle/fd based IO
+    void flush() const;
+
     void read_raw(void * ptr, size_t len);
     void read_raw_unsafe(void * ptr, size_t len);
     void read_aligned_chunk(void * dest, size_t size);
     uint32_t read_u32();
+
+    // thread-safe IO at an absolute offset, does not touch the file position
+    void read_at(void * ptr, size_t len, size_t offset) const;
+    void write_at(const void * ptr, size_t len, size_t offset) const;
 
     void write_raw(const void * ptr, size_t len) const;
     void write_u32(uint32_t val) const;
