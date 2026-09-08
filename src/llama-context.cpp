@@ -13,12 +13,19 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <queue>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 //
 // llama_context
@@ -2682,9 +2689,116 @@ private:
     std::vector<read_info> rinfos;
 };
 
+// split a list of blocks into contiguous groups, balancing by total bytes
+// contiguous groups keep the file locality per worker thread
+static std::vector<std::pair<size_t, size_t>> io_file_block_groups(const std::vector<llama_io_block> & blocks, size_t n_threads) {
+    size_t total = 0;
+    for (const auto & block : blocks) {
+        total += block.size;
+    }
+
+    const size_t n_groups = std::min<size_t>(n_threads, blocks.size());
+    const size_t target = total / n_groups;
+
+    std::vector<std::pair<size_t, size_t>> groups;
+    size_t i = 0;
+    while (i < blocks.size()) {
+        const size_t i0 = i;
+        size_t bytes = 0;
+        while (i < blocks.size() && bytes < target) {
+            bytes += blocks[i].size;
+            ++i;
+        }
+        if (i == i0) {
+            ++i;
+        }
+        groups.emplace_back(i0, i);
+    }
+
+    return groups;
+}
+
+// a fixed-size pool of worker threads, reused across read_blocks/write_blocks calls
+struct io_file_workers {
+    std::vector<std::thread> threads;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::queue<std::function<void()>> tasks;
+    size_t n_running = 0;
+    std::exception_ptr eptr;
+    bool shutdown = false;
+
+    explicit io_file_workers(size_t n) {
+        for (size_t i = 0; i < n; ++i) {
+            threads.emplace_back([this]() {
+                for (;;) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(mutex);
+                        cv.wait(lock, [this]() { return shutdown || !tasks.empty(); });
+                        if (shutdown && tasks.empty()) {
+                            return;
+                        }
+                        task = std::move(tasks.front());
+                        tasks.pop();
+                        ++n_running;
+                    }
+
+                    try {
+                        task();
+                    } catch (...) {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        if (!eptr) {
+                            eptr = std::current_exception();
+                        }
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        --n_running;
+                    }
+                    cv.notify_all();
+                }
+            });
+        }
+    }
+
+    ~io_file_workers() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            shutdown = true;
+        }
+        cv.notify_all();
+        for (auto & t : threads) {
+            t.join();
+        }
+    }
+
+    // run all tasks, rethrowing the first error on the caller
+    void run(std::vector<std::function<void()>> && task_list) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (auto & task : task_list) {
+                tasks.push(std::move(task));
+            }
+        }
+        cv.notify_all();
+
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [this]() { return tasks.empty() && n_running == 0; });
+
+        auto eptr = this->eptr;
+        this->eptr = nullptr;
+        if (eptr) {
+            std::rethrow_exception(eptr);
+        }
+    }
+};
+
 class llama_io_write_file : public llama_io_write_i {
 public:
-    llama_io_write_file(llama_file * f) : file(f) {}
+    llama_io_write_file(llama_file * f, size_t n_threads = 4)
+        : file(f), n_threads(std::max<size_t>(1, std::min<size_t>(8, n_threads))) {}
 
     void write(const void * src, size_t size) override {
         file->write_raw(src, size);
@@ -2697,19 +2811,85 @@ public:
         write(temp_buffer.data(), temp_buffer.size());
     }
 
+    size_t tell() const override {
+        return file->tell();
+    }
+
+    void write_blocks(const std::vector<llama_io_block> & blocks) override {
+        if (blocks.empty()) {
+            return;
+        }
+
+        // flush the buffered prefix before the absolute-offset writes
+        file->flush();
+
+        size_t total = 0;
+        for (const auto & block : blocks) {
+            total += block.size;
+        }
+
+        // transfer the blocks in parallel, each worker owns its staging buffer
+        auto process = [&](size_t i0, size_t i1) {
+            std::vector<uint8_t> buf;
+
+            for (size_t i = i0; i < i1; ++i) {
+                const auto & block = blocks[i];
+
+                size_t done = 0;
+                while (done < block.size) {
+                    const size_t chunk = std::min(IO_CHUNK, block.size - done);
+
+                    if (block.tensor) {
+                        buf.resize(chunk);
+                        ggml_backend_tensor_get(block.tensor, buf.data(), block.tensor_offset + done, chunk);
+                    }
+
+                    const uint8_t * src = block.tensor ? buf.data() : (const uint8_t *) block.data + done;
+                    file->write_at(src, chunk, block.offset + done);
+
+                    done += chunk;
+                }
+            }
+        };
+
+        const auto groups = io_file_block_groups(blocks, n_threads);
+        std::vector<std::function<void()>> tasks;
+        tasks.reserve(groups.size());
+        for (const auto & g : groups) {
+            tasks.emplace_back([process, g]() { process(g.first, g.second); });
+        }
+        get_workers().run(std::move(tasks));
+
+        // leave the stream at the end of the last block
+        file->seek(blocks.back().offset + blocks.back().size, SEEK_SET);
+        size_written += total;
+    }
+
     size_t n_bytes() override {
         return size_written;
     }
 
 private:
+    io_file_workers & get_workers() {
+        if (!workers) {
+            workers.reset(new io_file_workers(n_threads));
+        }
+        return *workers;
+    }
+
+    static constexpr size_t IO_CHUNK = 32*1024*1024;
+
     llama_file * file;
+    size_t n_threads;
     size_t size_written = 0;
     std::vector<uint8_t> temp_buffer;
+    std::unique_ptr<io_file_workers> workers;
 };
 
 class llama_io_read_file : public llama_io_read_i {
 public:
-    llama_io_read_file(llama_file * f) : file(f) {}
+    llama_io_read_file(llama_file * f, size_t n_threads = 4)
+        : file(f), n_threads(std::max<size_t>(1, std::min<size_t>(8, n_threads))) {}
 
     void read(void * dst, size_t size) override {
         file->read_raw(dst, size);
@@ -2722,14 +2902,72 @@ public:
         ggml_backend_tensor_set(tensor, temp_buffer.data(), offset, size);
     }
 
+    size_t tell() const override {
+        return file->tell();
+    }
+
+    void read_blocks(const std::vector<llama_io_block> & blocks) override {
+        if (blocks.empty()) {
+            return;
+        }
+
+        size_t total = 0;
+        for (const auto & block : blocks) {
+            total += block.size;
+        }
+
+        // transfer the blocks in parallel, each worker owns its staging buffer
+        auto process = [&](size_t i0, size_t i1) {
+            std::vector<uint8_t> buf;
+
+            for (size_t i = i0; i < i1; ++i) {
+                const auto & block = blocks[i];
+
+                size_t done = 0;
+                while (done < block.size) {
+                    const size_t chunk = std::min(IO_CHUNK, block.size - done);
+
+                    buf.resize(chunk);
+                    file->read_at(buf.data(), chunk, block.offset + done);
+                    ggml_backend_tensor_set(block.tensor, buf.data(), block.tensor_offset + done, chunk);
+
+                    done += chunk;
+                }
+            }
+        };
+
+        const auto groups = io_file_block_groups(blocks, n_threads);
+        std::vector<std::function<void()>> tasks;
+        tasks.reserve(groups.size());
+        for (const auto & g : groups) {
+            tasks.emplace_back([process, g]() { process(g.first, g.second); });
+        }
+        get_workers().run(std::move(tasks));
+
+        // leave the stream at the end of the last block
+        file->seek(blocks.back().offset + blocks.back().size, SEEK_SET);
+        size_read += total;
+    }
+
     size_t n_bytes() override {
         return size_read;
     }
 
 private:
+    io_file_workers & get_workers() {
+        if (!workers) {
+            workers.reset(new io_file_workers(n_threads));
+        }
+        return *workers;
+    }
+
+    static constexpr size_t IO_CHUNK = 32*1024*1024;
+
     llama_file * file;
+    size_t n_threads;
     size_t size_read = 0;
     std::vector<uint8_t> temp_buffer;
+    std::unique_ptr<io_file_workers> workers;
 };
 
 class llama_io_write_device : public llama_io_write_i {
@@ -3168,7 +3406,7 @@ bool llama_context::state_load_file(const char * filepath, llama_token * tokens_
     {
         const size_t n_state_size_cur = file.size() - file.tell();
 
-        llama_io_read_file io( &file);
+        llama_io_read_file io(&file, cparams.n_threads);
         const size_t n_read = state_read_data(io);
 
         if (n_read != n_state_size_cur) {
@@ -3191,7 +3429,7 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
     file.write_raw(tokens, sizeof(llama_token) * n_token_count);
 
     // save the context state using stream saving
-    llama_io_write_file io(&file);
+    llama_io_write_file io(&file, cparams.n_threads);
     state_write_data(io);
 
     return true;
@@ -3238,7 +3476,7 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     // restore the context state
     {
         const size_t state_size = file.size() - file.tell();
-        llama_io_read_file io(&file);
+        llama_io_read_file io(&file, cparams.n_threads);
         const size_t nread = state_seq_read_data(io, seq_id, 0);
         if (!nread) {
             LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
@@ -3262,7 +3500,7 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     file.write_raw(tokens, sizeof(llama_token) * n_token_count);
 
     // save the context state using stream saving
-    llama_io_write_file io(&file);
+    llama_io_write_file io(&file, cparams.n_threads);
     state_seq_write_data(io, seq_id, 0);
 
     const size_t res = file.tell();
