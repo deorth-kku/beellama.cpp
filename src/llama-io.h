@@ -2,10 +2,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 struct ggml_tensor;
+struct llama_file;
 
 // a single data block of a state stream, at an absolute offset in stream coordinates
 // tensor != nullptr: tensor data, transferred via ggml_backend_tensor_get/set
@@ -73,4 +75,58 @@ public:
     virtual size_t n_bytes() = 0;
 
     void read_string(std::string & str);
+};
+
+// pool of worker threads for parallel block transfer, defined in llama-io.cpp
+class io_file_workers;
+
+// file-based io, blocks are transferred in parallel through llama_file::read_at/write_at
+class llama_io_read_file : public llama_io_read_i {
+public:
+    llama_io_read_file(llama_file * f, size_t n_threads = 4);
+    ~llama_io_read_file();
+
+    void read(void * dst, size_t size) override;
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override;
+
+    size_t tell() const override;
+    void read_blocks(const std::vector<llama_io_block> & blocks) override;
+
+    size_t n_bytes() override;
+
+private:
+    io_file_workers & get_workers();
+
+    static constexpr size_t IO_CHUNK = 32*1024*1024;
+
+    llama_file * file;
+    size_t n_threads;
+    size_t size_read = 0;
+    std::vector<uint8_t> temp_buffer;
+    std::unique_ptr<io_file_workers> workers;
+};
+
+class llama_io_write_file : public llama_io_write_i {
+public:
+    llama_io_write_file(llama_file * f, size_t n_threads = 4);
+    ~llama_io_write_file();
+
+    void write(const void * src, size_t size) override;
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override;
+
+    size_t tell() const override;
+    void write_blocks(const std::vector<llama_io_block> & blocks) override;
+
+    size_t n_bytes() override;
+
+private:
+    io_file_workers & get_workers();
+
+    static constexpr size_t IO_CHUNK = 32*1024*1024;
+
+    llama_file * file;
+    size_t n_threads;
+    size_t size_written = 0;
+    std::vector<uint8_t> temp_buffer;
+    std::unique_ptr<io_file_workers> workers;
 };
