@@ -249,22 +249,17 @@ void llama_io_read_file::read_blocks(const std::vector<llama_io_block> & blocks)
     }
 
     // transfer the blocks in parallel, each worker owns its staging buffer
+    // each block is staged in full, as some buffers (cpu repack) only accept a
+    // single set_tensor call covering the whole tensor
     auto process = [&](size_t i0, size_t i1) {
         std::vector<uint8_t> buf;
 
         for (size_t i = i0; i < i1; ++i) {
             const auto & block = blocks[i];
 
-            size_t done = 0;
-            while (done < block.size) {
-                const size_t chunk = std::min(IO_CHUNK, block.size - done);
-
-                buf.resize(chunk);
-                file->read_at(buf.data(), chunk, block.offset + done);
-                ggml_backend_tensor_set(block.tensor, buf.data(), block.tensor_offset + done, chunk);
-
-                done += chunk;
-            }
+            buf.resize(block.size);
+            file->read_at(buf.data(), block.size, block.offset);
+            ggml_backend_tensor_set(block.tensor, buf.data(), block.tensor_offset, block.size);
         }
     };
 
