@@ -4,7 +4,11 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
+#include "llama-io.h"
 #include "llama.h"
+
+// declared in ggml/src/ggml-backend-impl.h, not on the include path of this module
+extern "C" bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft);
 
 #include <algorithm>
 #include <array>
@@ -13,6 +17,7 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <thread>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1615,10 +1620,65 @@ bool llama_model_loader::load_all_data(
         });
     }
 
+    // tensors read via the parallel block path:
+    // host buffers always, device buffers when there is no async upload and no tensor check
+    // (the check needs the per-tensor path to validate the staging data)
+    // meta (split) buffers are excluded: their split-state cache is not thread-safe
+    auto via_blocks = [&](const struct ggml_tensor * t) {
+        if (use_mmap || lazy.has(t) || !t->buffer) {
+            return false;
+        }
+        if (ggml_backend_buft_is_meta(ggml_backend_buffer_get_type(t->buffer))) {
+            return false;
+        }
+        const bool host = ggml_backend_buffer_is_host(t->buffer);
+        return host || (!upload_backend && !check_tensors);
+    };
+
+    // plan the blocks per file, then transfer each file in parallel
+    std::vector<std::vector<llama_io_block>> file_blocks(files.size());
+    for (struct ggml_tensor * cur : tensors) {
+        const auto * weight = get_weight(ggml_get_name(cur));
+        if (weight == nullptr || !via_blocks(cur)) {
+            continue;
+        }
+        file_blocks[weight->idx].push_back({weight->offs, ggml_nbytes(cur), cur, 0, nullptr});
+    }
+
+    for (uint32_t idx = 0; idx < files.size(); ++idx) {
+        if (file_blocks[idx].empty()) {
+            continue;
+        }
+        // ascending offset order keeps the file locality per worker group
+        std::sort(file_blocks[idx].begin(), file_blocks[idx].end(), [](const auto & a, const auto & b) {
+            return a.offset < b.offset;
+        });
+
+        if (progress_callback && !progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+            return false;
+        }
+
+        llama_io_read_file io(files[idx].get(), std::thread::hardware_concurrency());
+        io.read_blocks(file_blocks[idx]);
+        size_done += io.n_bytes();
+
+        if (check_tensors) {
+            for (const auto & block : file_blocks[idx]) {
+                validation_result.emplace_back(std::async(std::launch::async, [t = block.tensor] {
+                    return std::make_pair(t, ggml_validate_row_data(t->type, t->data, ggml_nbytes(t)));
+                }));
+            }
+        }
+    }
+
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models
+            continue;
+        }
+
+        if (via_blocks(cur)) {
             continue;
         }
 
@@ -1665,77 +1725,67 @@ bool llama_model_loader::load_all_data(
         } else {
             const auto & file = files.at(weight->idx);
 
-            if (ggml_backend_buffer_is_host(cur->buffer)) {
-                file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
-                if (check_tensors) {
-                    validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
-                        return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
-                    }));
+            // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
+            if (upload_backend) {
+                size_t offset = weight->offs;
+                alignment = file->read_alignment();
+                size_t aligned_offset = offset & ~(alignment - 1);
+                size_t offset_from_alignment = offset - aligned_offset;
+                file->seek(aligned_offset, SEEK_SET);
+
+                // Calculate aligned read boundaries
+                size_t read_start = aligned_offset;
+                size_t read_end = (offset + n_size + alignment - 1) & ~(alignment - 1);
+
+                size_t bytes_read = 0;
+                size_t data_read = 0;  // Actual tensor data copied (excluding padding)
+
+                while (bytes_read < read_end - read_start) {
+                    size_t read_size = std::min<size_t>(buffer_size, read_end - read_start - bytes_read);
+
+                    // Align the destination pointer within the pinned buffer
+                    uintptr_t ptr_dest_aligned = (reinterpret_cast<uintptr_t>(host_ptrs[buffer_idx]) + alignment - 1) & ~(alignment - 1);
+
+                    // Wait for previous upload to complete before reusing buffer
+                    ggml_backend_event_synchronize(events[buffer_idx]);
+
+                    // Read aligned chunk from file
+                    file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
+
+                    // Calculate actual data portion (excluding alignment padding)
+                    uintptr_t ptr_data = ptr_dest_aligned;
+                    size_t data_to_copy = read_size;
+
+                    // Skip alignment padding at start of first chunk
+                    if (bytes_read == 0) {
+                        ptr_data += offset_from_alignment;
+                        data_to_copy -= offset_from_alignment;
+                    }
+
+                    // Trim alignment padding at end of last chunk
+                    if (aligned_offset + bytes_read + read_size > offset + n_size) {
+                        data_to_copy -= (read_end - (offset + n_size));
+                    }
+
+                    // Async upload actual data to GPU
+                    ggml_backend_tensor_set_async(upload_backend, cur,
+                                                  reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
+                    ggml_backend_event_record(events[buffer_idx], upload_backend);
+
+                    data_read += data_to_copy;
+                    bytes_read += read_size;
+
+                    ++buffer_idx;
+                    buffer_idx %= n_buffers;
                 }
             } else {
-                // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
-                    size_t offset = weight->offs;
-                    alignment = file->read_alignment();
-                    size_t aligned_offset = offset & ~(alignment - 1);
-                    size_t offset_from_alignment = offset - aligned_offset;
-                    file->seek(aligned_offset, SEEK_SET);
-
-                    // Calculate aligned read boundaries
-                    size_t read_start = aligned_offset;
-                    size_t read_end = (offset + n_size + alignment - 1) & ~(alignment - 1);
-
-                    size_t bytes_read = 0;
-                    size_t data_read = 0;  // Actual tensor data copied (excluding padding)
-
-                    while (bytes_read < read_end - read_start) {
-                        size_t read_size = std::min<size_t>(buffer_size, read_end - read_start - bytes_read);
-
-                        // Align the destination pointer within the pinned buffer
-                        uintptr_t ptr_dest_aligned = (reinterpret_cast<uintptr_t>(host_ptrs[buffer_idx]) + alignment - 1) & ~(alignment - 1);
-
-                        // Wait for previous upload to complete before reusing buffer
-                        ggml_backend_event_synchronize(events[buffer_idx]);
-
-                        // Read aligned chunk from file
-                        file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
-
-                        // Calculate actual data portion (excluding alignment padding)
-                        uintptr_t ptr_data = ptr_dest_aligned;
-                        size_t data_to_copy = read_size;
-
-                        // Skip alignment padding at start of first chunk
-                        if (bytes_read == 0) {
-                            ptr_data += offset_from_alignment;
-                            data_to_copy -= offset_from_alignment;
-                        }
-
-                        // Trim alignment padding at end of last chunk
-                        if (aligned_offset + bytes_read + read_size > offset + n_size) {
-                            data_to_copy -= (read_end - (offset + n_size));
-                        }
-
-                        // Async upload actual data to GPU
-                        ggml_backend_tensor_set_async(upload_backend, cur,
-                                                      reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
-                        ggml_backend_event_record(events[buffer_idx], upload_backend);
-
-                        data_read += data_to_copy;
-                        bytes_read += read_size;
-
-                        ++buffer_idx;
-                        buffer_idx %= n_buffers;
-                    }
-                } else {
-                    // scoped to one tensor so only one staging buffer is alive at a time
-                    std::vector<no_init<uint8_t>> read_buf(n_size);
-                    file->seek(weight->offs, SEEK_SET);
-                    file->read_raw(read_buf.data(), n_size);
-                    ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
-                    if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
-                        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
-                    }
+                // scoped to one tensor so only one staging buffer is alive at a time
+                std::vector<no_init<uint8_t>> read_buf(n_size);
+                file->seek(weight->offs, SEEK_SET);
+                file->read_raw(read_buf.data(), n_size);
+                ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+                if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                    throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                 }
             }
         }
