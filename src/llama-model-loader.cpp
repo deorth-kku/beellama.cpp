@@ -1658,7 +1658,7 @@ bool llama_model_loader::load_all_data(
             return false;
         }
 
-        llama_io_read_file io(files[idx].get(), std::thread::hardware_concurrency());
+        llama_io_read_file io(files[idx].get(), n_threads_io > 0 ? n_threads_io : std::thread::hardware_concurrency());
         io.read_blocks(file_blocks[idx]);
         size_done += io.n_bytes();
 

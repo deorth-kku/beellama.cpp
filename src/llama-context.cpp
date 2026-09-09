@@ -21,6 +21,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 //
 // llama_context
@@ -112,6 +113,10 @@ llama_context::llama_context(
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
+    // n_threads <= 0 means all cores
+    cparams.n_threads_io            = params.n_threads_io > 0 ? params.n_threads_io
+                                    : params.n_threads     > 0 ? params.n_threads
+                                    : std::thread::hardware_concurrency();
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
@@ -3120,7 +3125,7 @@ bool llama_context::state_load_file(const char * filepath, llama_token * tokens_
     {
         const size_t n_state_size_cur = file.size() - file.tell();
 
-        llama_io_read_file io(&file, cparams.n_threads);
+        llama_io_read_file io(&file, cparams.n_threads_io);
         const size_t n_read = state_read_data(io);
 
         if (n_read != n_state_size_cur) {
@@ -3143,7 +3148,7 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
     file.write_raw(tokens, sizeof(llama_token) * n_token_count);
 
     // save the context state using stream saving
-    llama_io_write_file io(&file, cparams.n_threads);
+    llama_io_write_file io(&file, cparams.n_threads_io);
     state_write_data(io);
 
     return true;
@@ -3190,7 +3195,7 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     // restore the context state
     {
         const size_t state_size = file.size() - file.tell();
-        llama_io_read_file io(&file, cparams.n_threads);
+        llama_io_read_file io(&file, cparams.n_threads_io);
         const size_t nread = state_seq_read_data(io, seq_id, 0);
         if (!nread) {
             LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
@@ -3214,7 +3219,7 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     file.write_raw(tokens, sizeof(llama_token) * n_token_count);
 
     // save the context state using stream saving
-    llama_io_write_file io(&file, cparams.n_threads);
+    llama_io_write_file io(&file, cparams.n_threads_io);
     state_seq_write_data(io, seq_id, 0);
 
     const size_t res = file.tell();
@@ -3578,6 +3583,7 @@ llama_context_params llama_context_default_params() {
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
+        /*.n_threads_io                =*/ 0,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,

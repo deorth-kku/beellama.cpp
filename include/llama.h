@@ -326,6 +326,9 @@ extern "C" {
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 
+        // number of threads to use for file IO during model loading, 0 = hardware_concurrency
+        int32_t n_threads_io;
+
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 
@@ -366,6 +369,7 @@ extern "C" {
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
+        int32_t  n_threads_io;          // number of threads to use for file IO, e.g. slot save/restore, 0 = n_threads
 
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`

@@ -425,6 +425,9 @@ std::string common_params_get_system_info(const common_params & params) {
     if (params.cpuparams_batch.n_threads != -1) {
         os << " (n_threads_batch = " << params.cpuparams_batch.n_threads << ")";
     }
+    if (params.n_threads_io > 0) {
+        os << " (n_threads_io = " << params.n_threads_io << ")";
+    }
 #if defined(_WIN32) && (_WIN32_WINNT >= 0x0601) && !defined(__MINGW64__) // windows 7 and later
     // TODO: windows + arm64 + mingw64
     DWORD logicalProcessorCount = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
@@ -1686,6 +1689,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
     mparams.n_gpu_layers    = params.n_gpu_layers;
     mparams.main_gpu        = params.main_gpu;
+    mparams.n_threads_io    = params.n_threads_io > 0 ? params.n_threads_io : params.cpuparams.n_threads;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
     mparams.lazy_mode = params.lazy_mode;
@@ -1729,6 +1733,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_threads         = params.cpuparams.n_threads;
     cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
                                 params.cpuparams.n_threads : params.cpuparams_batch.n_threads;
+    cparams.n_threads_io      = params.n_threads_io > 0 ? params.n_threads_io : params.cpuparams.n_threads;
     cparams.embeddings        = params.embedding;
     cparams.rope_scaling_type = params.rope_scaling_type;
     cparams.rope_freq_base    = params.rope_freq_base;
