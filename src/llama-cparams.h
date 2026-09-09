@@ -18,6 +18,7 @@ struct llama_cparams {
     uint32_t n_outputs_max_per_seq;
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
+    int32_t  n_threads_io;    // number of threads to use for file IO, e.g. slot save/restore, 0 = n_threads
 
     int32_t  nextn_layer_offset = 0;
 
