@@ -77,10 +77,8 @@ public:
     void read_string(std::string & str);
 };
 
-// pool of worker threads for parallel block transfer, defined in llama-io.cpp
-class io_file_workers;
-
 // file-based io, blocks are transferred in parallel through llama_file::read_at/write_at
+// the worker pool is process-wide and shared by all file io objects
 class llama_io_read_file : public llama_io_read_i {
 public:
     llama_io_read_file(llama_file * f, size_t n_threads = 4);
@@ -95,15 +93,12 @@ public:
     size_t n_bytes() override;
 
 private:
-    io_file_workers & get_workers();
-
     static constexpr size_t IO_CHUNK = 32*1024*1024;
 
     llama_file * file;
     size_t n_threads;
     size_t size_read = 0;
     std::vector<uint8_t> temp_buffer;
-    std::unique_ptr<io_file_workers> workers;
 };
 
 class llama_io_write_file : public llama_io_write_i {
@@ -120,13 +115,10 @@ public:
     size_t n_bytes() override;
 
 private:
-    io_file_workers & get_workers();
-
     static constexpr size_t IO_CHUNK = 32*1024*1024;
 
     llama_file * file;
     size_t n_threads;
     size_t size_written = 0;
     std::vector<uint8_t> temp_buffer;
-    std::unique_ptr<io_file_workers> workers;
 };

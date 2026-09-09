@@ -84,6 +84,9 @@ struct llama_model_loader {
     bool no_alloc;
     bool load_mtp;
 
+    // number of threads for the parallel file IO in load_all_data, 0 = hardware_concurrency
+    int32_t n_threads_io = 0;
+
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
     struct lazy_read {

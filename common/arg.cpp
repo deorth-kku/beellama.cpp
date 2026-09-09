@@ -1531,6 +1531,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--threads-io"}, "N",
+        "number of threads to use for file IO, e.g. model loading and slot save/restore (default: same as --threads)",
+        [](common_params & params, int value) {
+            params.n_threads_io = value;
+        }
+    ).set_env("LLAMA_ARG_THREADS_IO"));
+    add_opt(common_arg(
         {"-C", "--cpu-mask"}, "M",
         "CPU affinity mask: arbitrarily long hex. Complements cpu-range (default: \"\")",
         [](common_params & params, const std::string & mask) {

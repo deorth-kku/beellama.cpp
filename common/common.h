@@ -488,6 +488,8 @@ struct common_params {
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 
+    int n_threads_io = 0;  // number of threads for file IO, e.g. model loading and slot save/restore, 0 = use cpuparams.n_threads
+
     ggml_backend_sched_eval_callback cb_eval = nullptr;
     void * cb_eval_user_data                 = nullptr;
 
