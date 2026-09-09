@@ -135,10 +135,26 @@ struct io_file_workers {
             std::rethrow_exception(eptr);
         }
     }
+
+    size_t n_threads() const {
+        return threads.size();
+    }
 };
 
+// global pool of worker threads, shared by all file io objects
+// created once on first use, the size is fixed by the first caller
+static io_file_workers & io_file_workers_global(size_t n_threads) {
+    static std::mutex mutex;
+    static std::unique_ptr<io_file_workers> workers;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!workers) {
+        workers.reset(new io_file_workers(std::max<size_t>(1, n_threads)));
+    }
+    return *workers;
+}
+
 llama_io_write_file::llama_io_write_file(llama_file * f, size_t n_threads)
-    : file(f), n_threads(std::max<size_t>(1, std::min<size_t>(8, n_threads))) {}
+    : file(f), n_threads(std::max<size_t>(1, n_threads)) {}
 
 llama_io_write_file::~llama_io_write_file() = default;
 
@@ -194,13 +210,14 @@ void llama_io_write_file::write_blocks(const std::vector<llama_io_block> & block
         }
     };
 
-    const auto groups = io_file_block_groups(blocks, n_threads);
+    auto & workers = io_file_workers_global(n_threads);
+    const auto groups = io_file_block_groups(blocks, std::min(n_threads, workers.n_threads()));
     std::vector<std::function<void()>> tasks;
     tasks.reserve(groups.size());
     for (const auto & g : groups) {
         tasks.emplace_back([process, g]() { process(g.first, g.second); });
     }
-    get_workers().run(std::move(tasks));
+    workers.run(std::move(tasks));
 
     // leave the stream at the end of the last block
     file->seek(blocks.back().offset + blocks.back().size, SEEK_SET);
@@ -211,15 +228,8 @@ size_t llama_io_write_file::n_bytes() {
     return size_written;
 }
 
-io_file_workers & llama_io_write_file::get_workers() {
-    if (!workers) {
-        workers.reset(new io_file_workers(n_threads));
-    }
-    return *workers;
-}
-
 llama_io_read_file::llama_io_read_file(llama_file * f, size_t n_threads)
-    : file(f), n_threads(std::max<size_t>(1, std::min<size_t>(8, n_threads))) {}
+    : file(f), n_threads(std::max<size_t>(1, n_threads)) {}
 
 llama_io_read_file::~llama_io_read_file() = default;
 
@@ -263,13 +273,14 @@ void llama_io_read_file::read_blocks(const std::vector<llama_io_block> & blocks)
         }
     };
 
-    const auto groups = io_file_block_groups(blocks, n_threads);
+    auto & workers = io_file_workers_global(n_threads);
+    const auto groups = io_file_block_groups(blocks, std::min(n_threads, workers.n_threads()));
     std::vector<std::function<void()>> tasks;
     tasks.reserve(groups.size());
     for (const auto & g : groups) {
         tasks.emplace_back([process, g]() { process(g.first, g.second); });
     }
-    get_workers().run(std::move(tasks));
+    workers.run(std::move(tasks));
 
     // leave the stream at the end of the last block
     file->seek(blocks.back().offset + blocks.back().size, SEEK_SET);
@@ -278,11 +289,4 @@ void llama_io_read_file::read_blocks(const std::vector<llama_io_block> & blocks)
 
 size_t llama_io_read_file::n_bytes() {
     return size_read;
-}
-
-io_file_workers & llama_io_read_file::get_workers() {
-    if (!workers) {
-        workers.reset(new io_file_workers(n_threads));
-    }
-    return *workers;
 }
