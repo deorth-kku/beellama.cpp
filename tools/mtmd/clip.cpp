@@ -17,8 +17,10 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 #include <vector>
 #include <cinttypes>
@@ -178,19 +180,27 @@ struct clip_ctx {
     std::mt19937 rng{std::random_device{}()};
     uint32_t rng_seed = UINT32_MAX;
 
-    clip_ctx(clip_context_params & ctx_params) {
-        flash_attn_type = ctx_params.flash_attn_type;
-        no_alloc = ctx_params.no_alloc;
+    // original params and file name, kept to reinit the backend after a device reset
+    clip_context_params params;
+    std::string fname;
+
+    // set when the backend cannot be reinitialized; further encodes fail without crashing
+    bool dead = false;
+
+    // the sched is not safe for concurrent use, this serializes encode and reinit
+    std::mutex encode_mtx;
+
+    void init_backend() {
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
         }
-        if (ctx_params.use_gpu) {
-            if (ctx_params.device != nullptr) {
-                backend = ggml_backend_dev_init(ctx_params.device, nullptr);
+        if (params.use_gpu) {
+            if (params.device != nullptr) {
+                backend = ggml_backend_dev_init(params.device, nullptr);
                 if (!backend) {
                     throw std::runtime_error(string_format("%s: failed to initialize \"%s\" backend\n",
-                                                           __func__, ggml_backend_dev_name(ctx_params.device)));
+                                                           __func__, ggml_backend_dev_name(params.device)));
                 }
             } else {
                 backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
@@ -207,13 +217,6 @@ struct clip_ctx {
             LOG_INF("%s: CLIP using CPU backend\n", __func__);
         }
 
-        if (ctx_params.image_min_tokens > 0) {
-            model.hparams.custom_image_min_tokens = ctx_params.image_min_tokens;
-        }
-        if (ctx_params.image_max_tokens > 0) {
-            model.hparams.custom_image_max_tokens = ctx_params.image_max_tokens;
-        }
-
         backend_ptrs.push_back(backend_cpu);
         backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
 
@@ -221,10 +224,22 @@ struct clip_ctx {
             ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true)
         );
 
-        if (ctx_params.cb_eval != nullptr) {
-            ggml_backend_sched_set_eval_callback(sched.get(), ctx_params.cb_eval, ctx_params.cb_eval_user_data);
+        if (params.cb_eval != nullptr) {
+            ggml_backend_sched_set_eval_callback(sched.get(), params.cb_eval, params.cb_eval_user_data);
         }
+    }
 
+    clip_ctx(const char * fname, clip_context_params & ctx_params)
+        : params(ctx_params), fname(fname) {
+        flash_attn_type = params.flash_attn_type;
+        no_alloc = params.no_alloc;
+        init_backend();
+        if (params.image_min_tokens > 0) {
+            model.hparams.custom_image_min_tokens = params.image_min_tokens;
+        }
+        if (params.image_max_tokens > 0) {
+            model.hparams.custom_image_max_tokens = params.image_max_tokens;
+        }
         debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
     }
 
@@ -3954,6 +3969,90 @@ struct clip_model_loader {
     }
 };
 
+// reinit the backend and reload the weights, used after a device reset (e.g. Vulkan device lost)
+// on failure sets ctx->dead and returns false
+static bool clip_ctx_reinit(clip_ctx * ctx) {
+    LOG_WRN("%s: reinitializing backend for %s\n", __func__, ctx->fname.c_str());
+
+    // free the old state; model tensors point into ctx_data, so reset model as well
+    const clip_modality modality = ctx->model.modality;
+    ctx->sched.reset();
+    ctx->buf.reset();
+    ctx->ctx_data.reset();
+    ctx->buf_compute_meta.clear();
+    ctx->mem_usage.clear();
+    ctx->mem_compute.clear();
+    ctx->is_allocated = false;
+    ctx->support_batch = false;
+    ctx->model = clip_model{};
+    ctx->flash_attn_type = ctx->params.flash_attn_type;
+    if (ctx->backend && ctx->backend != ctx->backend_cpu) {
+        ggml_backend_free(ctx->backend);
+    }
+    if (ctx->backend_cpu) {
+        ggml_backend_free(ctx->backend_cpu);
+    }
+    ctx->backend = nullptr;
+    ctx->backend_cpu = nullptr;
+    ctx->backend_ptrs.clear();
+    ctx->backend_buft.clear();
+
+    try {
+        ctx->init_backend();
+    } catch (const std::exception & e) {
+        LOG_WRN("%s: backend reinit failed: %s\n", __func__, e.what());
+        LOG_WRN("%s: falling back to CPU backend\n", __func__);
+        if (ctx->backend_cpu) {
+            ggml_backend_free(ctx->backend_cpu);
+            ctx->backend_cpu = nullptr;
+        }
+        ctx->params.use_gpu = false;
+        try {
+            ctx->init_backend();
+        } catch (const std::exception & e2) {
+            LOG_ERR("%s: CPU backend init failed: %s\n", __func__, e2.what());
+            ctx->dead = true;
+            return false;
+        }
+    }
+
+    try {
+        clip_model_loader loader(ctx->fname.c_str(),
+                                 /* skip_tensors */ false,
+                                 ctx->params.progress_callback,
+                                 ctx->params.progress_callback_user_data);
+        loader.load_hparams(ctx->model, modality);
+        loader.load_tensors(*ctx);
+        if (modality == CLIP_MODALITY_GEN_AUDIO) {
+            // clip_init skips init_ctx for gen audio, mirror that here
+            ctx->buf_compute_meta.resize(ctx->max_nodes * ggml_tensor_overhead() + ggml_graph_overhead());
+        } else {
+            clip_model_loader::init_ctx(*ctx);
+        }
+        // the model reset above wiped the custom token limits, re-apply them
+        if (ctx->params.image_min_tokens > 0) {
+            ctx->model.hparams.custom_image_min_tokens = ctx->params.image_min_tokens;
+        }
+        if (ctx->params.image_max_tokens > 0) {
+            ctx->model.hparams.custom_image_max_tokens = ctx->params.image_max_tokens;
+        }
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: failed to reload model: %s\n", __func__, e.what());
+        ctx->dead = true;
+        return false;
+    }
+
+    if (ctx->params.warmup && modality != CLIP_MODALITY_GEN_AUDIO) {
+        try {
+            clip_model_loader::warmup(*ctx);
+        } catch (const std::exception & e) {
+            // the device may still be recovering, keep the context usable and retry on the next encode
+            LOG_WRN("%s: warmup failed: %s\n", __func__, e.what());
+        }
+    }
+    return true;
+}
+
 struct clip_init_result clip_init(const char * fname, struct clip_context_params ctx_params) {
     clip_ctx * ctx_vision = nullptr;
     clip_ctx * ctx_audio = nullptr;
@@ -3967,7 +4066,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
         bool skip_audio = false;
 
         if (loader.has_vision) {
-            ctx_vision = new clip_ctx(ctx_params);
+            ctx_vision = new clip_ctx(fname, ctx_params);
             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
             loader.load_tensors(*ctx_vision);
             loader.init_ctx(*ctx_vision);
@@ -3981,7 +4080,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
         }
 
         if (loader.has_audio && !skip_audio) {
-            ctx_audio = new clip_ctx(ctx_params);
+            ctx_audio = new clip_ctx(fname, ctx_params);
             loader.load_hparams(ctx_audio->model, CLIP_MODALITY_AUDIO);
             loader.load_tensors(*ctx_audio);
             loader.init_ctx(*ctx_audio);
@@ -3991,7 +4090,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
         }
 
         if (loader.has_gen_audio) {
-            ctx_gen_audio = new clip_ctx(ctx_params);
+            ctx_gen_audio = new clip_ctx(fname, ctx_params);
             loader.load_hparams(ctx_gen_audio->model, CLIP_MODALITY_GEN_AUDIO);
             loader.load_tensors(*ctx_gen_audio);
             // TODO: fix warmup
@@ -4413,7 +4512,7 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
     }
 }
 
-bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+static bool clip_encode_impl(struct clip_ctx * ctx, struct clip_encode_params * params) {
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
 
@@ -5906,6 +6005,29 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     }
 
     return true;
+}
+
+// retry once after reinitializing the backend, e.g. when the Vulkan device was lost
+bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+    std::lock_guard<std::mutex> lock(ctx->encode_mtx);
+    if (ctx->dead) {
+        LOG_ERR("%s: backend is dead, cannot encode\n", __func__);
+        return false;
+    }
+    for (int attempt = 0; ; ++attempt) {
+        try {
+            return clip_encode_impl(ctx, params);
+        } catch (const std::exception & e) {
+            if (attempt > 0) {
+                LOG_ERR("%s: encode failed after reinit: %s\n", __func__, e.what());
+                return false;
+            }
+            LOG_WRN("%s: backend error: %s\n", __func__, e.what());
+            if (!clip_ctx_reinit(ctx)) {
+                return false;
+            }
+        }
+    }
 }
 
 int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
