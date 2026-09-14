@@ -134,6 +134,12 @@ MTMD_API mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
                                             const struct llama_model * text_model,
                                             const struct mtmd_context_params ctx_params);
 
+// initialize the mtmd context from a retained host context, skipping the file open/parse
+// the source context must be host-resident; return nullptr on failure
+MTMD_API mtmd_context * mtmd_init_from_ctx(const struct mtmd_context * src,
+                                           const struct llama_model * text_model,
+                                           const struct mtmd_context_params ctx_params);
+
 MTMD_API void mtmd_free(mtmd_context * ctx);
 
 // whether we need to set non-causal mask before llama_decode
