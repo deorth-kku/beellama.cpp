@@ -71,6 +71,9 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
 // max number of output tokens per image, -1 if not dynamic size
 int clip_get_image_max_tokens(const struct clip_ctx * ctx);
 
+// build a new clip context from a retained host context, skipping the file open/parse
+struct clip_ctx * clip_ctx_from_src(const struct clip_ctx * src, struct clip_context_params ctx_params);
+
 void clip_free(struct clip_ctx * ctx);
 
 // TODO: should be enum, not string
