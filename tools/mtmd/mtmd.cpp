@@ -538,6 +538,48 @@ struct mtmd_context {
         vocab           (text_model ? llama_model_get_vocab(text_model) : nullptr),
         batch_max_tokens(ctx_params.batch_max_tokens)
     {
+        init_common(text_model, ctx_params);
+
+        auto res = clip_init(mmproj_fname, make_clip_params(ctx_params, no_alloc));
+        ctx_v = res.ctx_v;
+        ctx_a = res.ctx_a;
+        ctx_gen_a = res.ctx_gen_a;
+
+        validate_and_init();
+    }
+
+    mtmd_context(const mtmd_context * src,
+                   const llama_model * text_model,
+                   const mtmd_context_params & ctx_params,
+                   bool no_alloc = false) :
+        print_timings   (ctx_params.print_timings),
+        n_threads       (ctx_params.n_threads),
+        media_marker    (ctx_params.media_marker),
+        n_embd_text     (text_model ? llama_model_n_embd_inp(text_model) : -1),
+        vocab           (text_model ? llama_model_get_vocab(text_model) : nullptr),
+        batch_max_tokens(ctx_params.batch_max_tokens)
+    {
+        init_common(text_model, ctx_params);
+
+        // build each modality from the retained host context
+        auto clip_params = make_clip_params(ctx_params, no_alloc);
+        try {
+            ctx_v     = src->ctx_v     ? clip_ctx_from_src(src->ctx_v,     clip_params) : nullptr;
+            ctx_a     = src->ctx_a     ? clip_ctx_from_src(src->ctx_a,     clip_params) : nullptr;
+            ctx_gen_a = src->ctx_gen_a ? clip_ctx_from_src(src->ctx_gen_a, clip_params) : nullptr;
+        } catch (...) {
+            // a later modality failing must not leak the earlier ones
+            delete ctx_v;
+            delete ctx_a;
+            delete ctx_gen_a;
+            throw;
+        }
+
+        validate_and_init();
+    }
+
+    // shared prologue: validate the params and derive the position type
+    void init_common(const llama_model * text_model, const mtmd_context_params & ctx_params) {
         if (ctx_params.image_marker != nullptr) {
             throw std::runtime_error("custom image_marker is not supported anymore, use media_marker instead");
         }
@@ -564,8 +606,10 @@ struct mtmd_context {
                     throw std::runtime_error(string_format("unsupported decoder rope type: %d\n", decoder_rope_type));
             }
         }
+    }
 
-        clip_context_params ctx_clip_params {
+    clip_context_params make_clip_params(const mtmd_context_params & ctx_params, bool no_alloc) const {
+        return clip_context_params {
             /* use_gpu           */ ctx_params.use_gpu,
             /* device            */ ctx_params.device,
             /* flash_attn_type   */ mtmd_get_clip_flash_attn_type(ctx_params.flash_attn_type),
@@ -578,13 +622,12 @@ struct mtmd_context {
             /* progress_callback */ ctx_params.progress_callback,
             /* progress_callback_user_data */ ctx_params.progress_callback_user_data,
         };
+    }
 
-        auto res = clip_init(mmproj_fname, ctx_clip_params);
-        ctx_v = res.ctx_v;
-        ctx_a = res.ctx_a;
-        ctx_gen_a = res.ctx_gen_a;
+    // shared epilogue: validate the embedding dims and init the preprocessors
+    void validate_and_init() {
         if (!ctx_v && !ctx_a) {
-            throw std::runtime_error(string_format("Failed to load CLIP model from %s\n", mmproj_fname));
+            throw std::runtime_error("Failed to load CLIP model");
         }
 
         // if both vision and audio mmproj are present, we need to validate their n_embd
@@ -1087,6 +1130,21 @@ mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
         const struct mtmd_context_params ctx_params) {
     try {
         return new mtmd_context(mmproj_fname, text_model, ctx_params);
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: error: %s\n", __func__, e.what());
+        return nullptr;
+    }
+}
+
+mtmd_context * mtmd_init_from_ctx(const mtmd_context * src,
+        const struct llama_model * text_model,
+        const struct mtmd_context_params ctx_params) {
+    if (src == nullptr) {
+        LOG_ERR("%s: null source context\n", __func__);
+        return nullptr;
+    }
+    try {
+        return new mtmd_context(src, text_model, ctx_params);
     } catch (const std::exception & e) {
         LOG_ERR("%s: error: %s\n", __func__, e.what());
         return nullptr;

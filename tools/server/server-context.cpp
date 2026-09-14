@@ -929,7 +929,12 @@ public:
             mp.batch_max_tokens = params_base.mtmd_batch_max_tokens;
             mp.media_marker     = get_media_marker();
 
-            mtmd_context * gpu = mtmd_init_from_file(params_base.mmproj.path.c_str(), model_tgt, mp);
+            // build from the retained host context, which skips the per-request
+            // GGUF open/parse and file read; fall back to the file path if that fails
+            mtmd_context * gpu = mctx ? mtmd_init_from_ctx(mctx, model_tgt, mp) : nullptr;
+            if (gpu == nullptr) {
+                gpu = mtmd_init_from_file(params_base.mmproj.path.c_str(), model_tgt, mp);
+            }
             if (gpu == nullptr) {
                 // The compute buffers are already gone, which costs nothing:
                 // the next decode re-reserves them. Fall back to the host

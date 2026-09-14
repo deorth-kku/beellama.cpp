@@ -2106,38 +2106,24 @@ struct clip_model_loader {
         }
     }
 
-    void load_tensors(clip_ctx & ctx_clip) {
+    // build the tensor structure of the model in ctx_clip
+    // tensor definitions are resolved from def_ctx and duplicated into ctx_clip.ctx_data
+    // when src is not null, small vectors and scalars are taken from the source context
+    // instead of the file, so no file access happens at all in that case
+    static void load_model_structure(clip_ctx & ctx_clip,
+            ggml_context * def_ctx,
+            const clip_ctx * src,
+            std::ifstream * fin,
+            struct gguf_context * ctx_gguf,
+            const std::map<std::string, size_t> & tensor_offset,
+            std::vector<ggml_tensor *> & tensors_to_load) {
         auto & model = ctx_clip.model;
         auto & hparams = model.hparams;
-        std::map<std::string, size_t> tensor_offset;
-        std::vector<ggml_tensor *> tensors_to_load;
-
-        auto fin = open_ifstream_binary(fname);
-        if (!fin) {
-            throw std::runtime_error(string_format("%s: failed to open %s\n", __func__, fname.c_str()));
-        }
 
         // TODO @ngxson : support both audio and video in the future
         const char * prefix = model.modality == CLIP_MODALITY_AUDIO ? "a"
                              : model.modality == CLIP_MODALITY_GEN_AUDIO ? "a.gen.code"
                              : "v";
-
-        // get offsets
-        for (int64_t i = 0; i < gguf_get_n_tensors(ctx_gguf.get()); ++i) {
-            const char * name = gguf_get_tensor_name(ctx_gguf.get(), i);
-            tensor_offset[name] = gguf_get_data_offset(ctx_gguf.get()) + gguf_get_tensor_offset(ctx_gguf.get(), i);
-        }
-
-        // create data context
-        struct ggml_init_params params = {
-            /*.mem_size =*/ static_cast<size_t>(gguf_get_n_tensors(ctx_gguf.get()) + 1) * ggml_tensor_overhead(),
-            /*.mem_buffer =*/ NULL,
-            /*.no_alloc =*/ true,
-        };
-        ctx_clip.ctx_data.reset(ggml_init(params));
-        if (!ctx_clip.ctx_data) {
-            throw std::runtime_error(string_format("%s: failed to init ggml context\n", __func__));
-        }
 
         // helper function
         std::unordered_set<std::string> loaded_tensor_names;
@@ -2146,7 +2132,7 @@ struct clip_model_loader {
             if (loaded_tensor_names.count(name)) {
                 throw std::runtime_error(string_format("%s: tensor already loaded: %s\n", __func__, name.c_str()));
             }
-            ggml_tensor * cur = ggml_get_tensor(ctx_meta.get(), name.c_str());
+            ggml_tensor * cur = ggml_get_tensor(def_ctx, name.c_str());
             if (!cur && required) {
                 throw std::runtime_error(string_format("%s: unable to find tensor %s\n", __func__, name.c_str()));
             }
@@ -2187,36 +2173,70 @@ struct clip_model_loader {
             }
         };
 
-        auto get_vector = [&](const std::string & name) {
+        auto get_vector = [&](const std::string & name) -> std::vector<float> {
+            if (src) {
+                // the values are already parsed in the source context
+                if (name == TN_MEL_FILTERS) {
+                    return src->model.hparams.mel_filters;
+                }
+                if (name == TN_WINDOW) {
+                    return src->model.hparams.window;
+                }
+                return {};
+            }
+
             std::vector<float> result;
             auto it = tensor_offset.find(name);
             if (it == tensor_offset.end()) {
                 return result;
             }
 
-            const int64_t idx = gguf_find_tensor(ctx_gguf.get(), name.c_str());
+            const int64_t idx = gguf_find_tensor(ctx_gguf, name.c_str());
             if (idx < 0) {
                 throw std::runtime_error(string_format("%s: failed to find tensor %s\n", __func__, name.c_str()));
             }
 
-            if (const auto type = gguf_get_tensor_type(ctx_gguf.get(), idx); type != GGML_TYPE_F32) {
+            if (const auto type = gguf_get_tensor_type(ctx_gguf, idx); type != GGML_TYPE_F32) {
                 throw std::runtime_error(string_format("%s: %s must be %s, was %s\n", __func__,
                             name.c_str(), ggml_type_name(GGML_TYPE_F32), ggml_type_name(type)));
             }
 
-            const size_t n_bytes = gguf_get_tensor_size(ctx_gguf.get(), idx);
+            const size_t n_bytes = gguf_get_tensor_size(ctx_gguf, idx);
             if (n_bytes == 0) {
                 throw std::runtime_error(string_format("%s: tensor %s is empty\n", __func__, name.c_str()));
             }
 
             const size_t n_elems = n_bytes / sizeof(float);
             result.resize(n_elems);
-            fin.seekg(it->second, std::ios::beg);
-            fin.read(reinterpret_cast<char*>(result.data()), n_bytes);
+            fin->seekg(it->second, std::ios::beg);
+            fin->read(reinterpret_cast<char*>(result.data()), n_bytes);
             return result;
         };
 
         auto get_scalar = [&](const std::string & name, float default_val) {
+            if (src) {
+                // name is <weight tensor name> + .input_max|.input_min|.output_max|.output_min
+                static const char * suffixes[] = {".input_max", ".input_min", ".output_max", ".output_min"};
+                for (int i = 0; i < 4; ++i) {
+                    const std::string suffix = suffixes[i];
+                    if (string_ends_with(name, suffix)) {
+                        const std::string base = name.substr(0, name.size() - suffix.size());
+                        auto it = src->model.clamp_info_map.find(base + ".weight");
+                        if (it != src->model.clamp_info_map.end()) {
+                            const auto & ci = it->second;
+                            switch (i) {
+                                case 0: return ci.inp_max;
+                                case 1: return ci.inp_min;
+                                case 2: return ci.out_max;
+                                case 3: return ci.out_min;
+                            }
+                        }
+                        return default_val;
+                    }
+                }
+                return default_val;
+            }
+
             auto v = get_vector(name);
             if (v.empty()) {
                 return default_val;
@@ -3591,6 +3611,35 @@ struct clip_model_loader {
             default:
                 GGML_ASSERT(false && "unknown projector type");
         }
+    }
+
+    void load_tensors(clip_ctx & ctx_clip) {
+        std::map<std::string, size_t> tensor_offset;
+        std::vector<ggml_tensor *> tensors_to_load;
+
+        auto fin = open_ifstream_binary(fname);
+        if (!fin) {
+            throw std::runtime_error(string_format("%s: failed to open %s\n", __func__, fname.c_str()));
+        }
+
+        // get offsets
+        for (int64_t i = 0; i < gguf_get_n_tensors(ctx_gguf.get()); ++i) {
+            const char * name = gguf_get_tensor_name(ctx_gguf.get(), i);
+            tensor_offset[name] = gguf_get_data_offset(ctx_gguf.get()) + gguf_get_tensor_offset(ctx_gguf.get(), i);
+        }
+
+        // create data context
+        struct ggml_init_params params = {
+            /*.mem_size =*/ static_cast<size_t>(gguf_get_n_tensors(ctx_gguf.get()) + 1) * ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc =*/ true,
+        };
+        ctx_clip.ctx_data.reset(ggml_init(params));
+        if (!ctx_clip.ctx_data) {
+            throw std::runtime_error(string_format("%s: failed to init ggml context\n", __func__));
+        }
+
+        load_model_structure(ctx_clip, ctx_meta.get(), /* src */ nullptr, &fin, ctx_gguf.get(), tensor_offset, tensors_to_load);
 
         // load data
         {
@@ -4020,6 +4069,85 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
     }
 
     return {ctx_vision, ctx_audio, ctx_gen_audio};
+}
+
+// build a new clip context from a retained host context
+// the parsed model structure is copied from src, so the GGUF open/parse and
+// the file read are skipped: only the buffer alloc and the host->device
+// copy of the weights happen here
+struct clip_ctx * clip_ctx_from_src(const struct clip_ctx * src, struct clip_context_params ctx_params) {
+    if (src == nullptr) {
+        throw std::runtime_error(string_format("%s: null source context\n", __func__));
+    }
+    GGML_ASSERT(src->ctx_data && "source context has no tensor data");
+    GGML_ASSERT(!src->no_alloc && "source context must have its weights loaded");
+    GGML_ASSERT(src->buf && ggml_backend_buft_is_host(ggml_backend_buffer_get_type(src->buf.get())) &&
+                "source context must be host-resident");
+
+    clip_ctx * ctx = new clip_ctx(ctx_params);
+    try {
+        // copy the parsed model structure; the tensor pointers are re-pointed
+        // to the new ctx_data by load_model_structure
+        ctx->model.hparams   = src->model.hparams;
+        ctx->model.modality  = src->model.modality;
+        ctx->model.proj_type = src->model.proj_type;
+        if (ctx_params.image_min_tokens > 0) {
+            ctx->model.hparams.custom_image_min_tokens = ctx_params.image_min_tokens;
+        }
+        if (ctx_params.image_max_tokens > 0) {
+            ctx->model.hparams.custom_image_max_tokens = ctx_params.image_max_tokens;
+        }
+
+        // create data context
+        size_t n_tensors = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(src->ctx_data.get()); t; t = ggml_get_next_tensor(src->ctx_data.get(), t)) {
+            n_tensors++;
+        }
+        struct ggml_init_params params = {
+            /*.mem_size =*/ static_cast<size_t>(n_tensors + 1) * ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc =*/ true,
+        };
+        ctx->ctx_data.reset(ggml_init(params));
+        if (!ctx->ctx_data) {
+            throw std::runtime_error(string_format("%s: failed to init ggml context\n", __func__));
+        }
+
+        std::vector<ggml_tensor *> tensors_to_load;
+        std::map<std::string, size_t> tensor_offset; // unused, the defs come from src
+        clip_model_loader::load_model_structure(*ctx, src->ctx_data.get(), src, /* fin */ nullptr, /* ctx_gguf */ nullptr, tensor_offset, tensors_to_load);
+
+        // alloc the weight buffer and copy the weights from the host context
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx->backend);
+        ctx->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx->ctx_data.get(), buft));
+        ggml_backend_buffer_set_usage(ctx->buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        if (!ctx->no_alloc) {
+            for (auto & t : tensors_to_load) {
+                ggml_tensor * cur = ggml_get_tensor(ctx->ctx_data.get(), t->name);
+                GGML_ASSERT(cur && "tensor not found in ctx_data");
+                const ggml_tensor * src_t = ggml_get_tensor(src->ctx_data.get(), t->name);
+                GGML_ASSERT(src_t && "tensor not found in the source context");
+                const size_t num_bytes = ggml_nbytes(cur);
+                ggml_backend_tensor_set(cur, src_t->data, 0, num_bytes);
+            }
+        }
+
+        // init the compute context, mirroring clip_init
+        if (ctx->model.modality == CLIP_MODALITY_GEN_AUDIO) {
+            // TODO: fix warmup
+            ctx->buf_compute_meta.resize(ctx->max_nodes * ggml_tensor_overhead() + ggml_graph_overhead());
+        } else {
+            clip_model_loader::init_ctx(*ctx);
+            if (ctx_params.warmup) {
+                clip_model_loader::warmup(*ctx);
+            }
+        }
+    } catch (...) {
+        delete ctx;
+        throw;
+    }
+
+    return ctx;
 }
 
 struct clip_cap clip_get_cap(const char * fname) {
