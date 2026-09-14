@@ -659,6 +659,49 @@ struct mtmd_context {
         text_model      (text_model),
         batch_max_tokens(ctx_params.batch_max_tokens)
     {
+        init_common(text_model, ctx_params);
+
+        ggml_backend_dev_t device = mtmd_select_device(ctx_params.use_gpu, ctx_params.device);
+        ggml_backend_buffer_type_t buft = device
+            ? ggml_backend_dev_buffer_type(device)
+            : ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+
+        models = mtmd_model_load(mmproj_fname, make_model_params(ctx_params, no_alloc), buft);
+
+        init_subcontexts(device, ctx_params, no_alloc);
+    }
+
+    mtmd_context(const mtmd_context * src,
+                   const llama_model * text_model,
+                   const mtmd_context_params & ctx_params,
+                   bool no_alloc = false) :
+        print_timings   (ctx_params.print_timings),
+        n_threads       (ctx_params.n_threads),
+        media_marker    (ctx_params.media_marker),
+        n_embd_text     (text_model ? llama_model_n_embd_inp(text_model) : -1),
+        vocab           (text_model ? llama_model_get_vocab(text_model) : nullptr),
+        text_model      (text_model),
+        batch_max_tokens(ctx_params.batch_max_tokens)
+    {
+        init_common(text_model, ctx_params);
+
+        ggml_backend_dev_t device = mtmd_select_device(ctx_params.use_gpu, ctx_params.device);
+        ggml_backend_buffer_type_t buft = device
+            ? ggml_backend_dev_buffer_type(device)
+            : ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+
+        // build each model from the retained host model, skipping the file open/parse
+        auto model_params = make_model_params(ctx_params, no_alloc);
+        const auto & sp = src->models;
+        models.v     = sp.v     ? mtmd_model_from_src(sp.v.get(),     model_params, buft) : nullptr;
+        models.a     = sp.a     ? mtmd_model_from_src(sp.a.get(),     model_params, buft) : nullptr;
+        models.gen_a = sp.gen_a ? mtmd_model_from_src(sp.gen_a.get(), model_params, buft) : nullptr;
+
+        init_subcontexts(device, ctx_params, no_alloc);
+    }
+
+    // shared prologue: validate the params and derive the position type
+    void init_common(const llama_model * text_model, const mtmd_context_params & ctx_params) {
         if (ctx_params.image_marker != nullptr) {
             throw std::runtime_error("custom image_marker is not supported anymore, use media_marker instead");
         }
@@ -685,24 +728,23 @@ struct mtmd_context {
                     throw std::runtime_error(string_format("unsupported decoder rope type: %d\n", decoder_rope_type));
             }
         }
+    }
 
-        ggml_backend_dev_t device = mtmd_select_device(ctx_params.use_gpu, ctx_params.device);
-
+    mtmd_model_params make_model_params(const mtmd_context_params & ctx_params, bool no_alloc) const {
         mtmd_model_params model_params;
         model_params.image_min_tokens            = ctx_params.image_min_tokens;
         model_params.image_max_tokens            = ctx_params.image_max_tokens;
         model_params.no_alloc                    = no_alloc;
         model_params.progress_callback           = ctx_params.progress_callback;
         model_params.progress_callback_user_data = ctx_params.progress_callback_user_data;
+        return model_params;
+    }
 
-        ggml_backend_buffer_type_t buft = device
-            ? ggml_backend_dev_buffer_type(device)
-            : ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
-        models = mtmd_model_load(mmproj_fname, model_params, buft);
-
+    // shared epilogue: create the subcontexts, validate the embedding dims and init the preprocessors
+    void init_subcontexts(ggml_backend_dev_t device, const mtmd_context_params & ctx_params, bool no_alloc) {
         // soprano and pocket-tts without voice cloning have no encoder
         if (!models.v && !models.a && !models.gen_a) {
-            throw std::runtime_error(string_format("Failed to load mmproj model from %s\n", mmproj_fname));
+            throw std::runtime_error("Failed to load mmproj model");
         }
 
         mtmd_subctx_params sctx_params {
@@ -1325,6 +1367,21 @@ mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
         const struct mtmd_context_params ctx_params) {
     try {
         return new mtmd_context(mmproj_fname, text_model, ctx_params);
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: error: %s\n", __func__, e.what());
+        return nullptr;
+    }
+}
+
+mtmd_context * mtmd_init_from_ctx(const mtmd_context * src,
+        const struct llama_model * text_model,
+        const struct mtmd_context_params ctx_params) {
+    if (src == nullptr) {
+        LOG_ERR("%s: null source context\n", __func__);
+        return nullptr;
+    }
+    try {
+        return new mtmd_context(src, text_model, ctx_params);
     } catch (const std::exception & e) {
         LOG_ERR("%s: error: %s\n", __func__, e.what());
         return nullptr;
