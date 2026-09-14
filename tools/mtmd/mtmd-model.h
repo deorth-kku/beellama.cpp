@@ -1614,6 +1614,9 @@ struct mtmd_models {
 // the weights are allocated in buft, throws on error
 mtmd_models mtmd_model_load(const char * fname, const mtmd_model_params & params, ggml_backend_buffer_type_t buft);
 
+// build a new model from a retained host model, skipping the file open/parse, throws on error
+std::unique_ptr<mtmd_model> mtmd_model_from_src(const mtmd_model * src, const mtmd_model_params & params, ggml_backend_buffer_type_t buft);
+
 struct mtmd_model_caps {
     bool has_vision;
     bool has_audio;
