@@ -4,6 +4,7 @@
 #include "fit.h"
 #include "log.h"
 #include "reasoning-budget.h"
+#include "trie.h"
 
 #include "ggml.h"
 
@@ -188,6 +189,229 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
+// logit bias with two tables, one per generation phase (reasoning vs normal)
+// the active table is switched by an accept()-driven state machine that tracks
+// the reasoning start/end tags, mirroring the reasoning-budget sampler
+struct common_sampler_logit_bias_phase {
+    const int32_t n_vocab;
+
+    const std::vector<llama_logit_bias> bias_normal;
+    const std::vector<llama_logit_bias> bias_reasoning;
+
+    common_token_matcher start_matcher;
+    common_token_matcher end_matcher;
+
+    bool in_reasoning = false;
+
+    std::vector<llama_logit_bias> to_search;
+
+    struct ggml_tensor * inp_logit_bias = nullptr;
+    struct ggml_tensor * inp_logit_idxs = nullptr;
+
+    const std::vector<llama_logit_bias> & active() const {
+        return in_reasoning ? bias_reasoning : bias_normal;
+    }
+
+    void copy_state(const common_sampler_logit_bias_phase & src) {
+        in_reasoning  = src.in_reasoning;
+        start_matcher = src.start_matcher;
+        end_matcher   = src.end_matcher;
+    }
+};
+
+static struct llama_sampler * common_sampler_logit_bias_phase_from_ctx(const common_sampler_logit_bias_phase & ctx);
+
+static struct llama_sampler * common_sampler_logit_bias_phase_init(
+        int32_t n_vocab,
+        const std::vector<llama_logit_bias> & bias_normal,
+        const std::vector<llama_logit_bias> & bias_reasoning,
+        const std::vector<llama_tokens> & start_seqs,
+        const std::vector<llama_tokens> & end_seqs);
+
+static const char * common_sampler_logit_bias_phase_name(const struct llama_sampler * smpl) {
+    GGML_UNUSED(smpl);
+    return "logit-bias-phase";
+}
+
+static void common_sampler_logit_bias_phase_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    auto * ctx = (common_sampler_logit_bias_phase *) smpl->ctx;
+
+    const auto & bias = ctx->active();
+    if (bias.empty()) {
+        return;
+    }
+
+    ctx->to_search.clear();
+
+    // update the candidates that have not been shuffled in the vocabulary (i.e. idx == id)
+    for (const auto & lb : bias) {
+        if (lb.token >= 0 && cur_p->size > (size_t) lb.token && cur_p->data[lb.token].id == lb.token) {
+            cur_p->data[lb.token].logit += lb.bias;
+        } else {
+            ctx->to_search.push_back(lb);
+        }
+    }
+
+    // search for the remaining candidates that were not found in the previous step
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        for (const auto & lb : ctx->to_search) {
+            if (cur_p->data[i].id == lb.token) {
+                cur_p->data[i].logit += lb.bias;
+                break;
+            }
+        }
+    }
+}
+
+static void common_sampler_logit_bias_phase_accept(struct llama_sampler * smpl, llama_token token) {
+    auto * ctx = (common_sampler_logit_bias_phase *) smpl->ctx;
+
+    if (ctx->in_reasoning) {
+        if (ctx->end_matcher.advance(token) >= 0) {
+            ctx->in_reasoning = false;
+            ctx->start_matcher.reset();
+        }
+    } else if (ctx->start_matcher.advance(token) >= 0) {
+        ctx->in_reasoning = true;
+        ctx->end_matcher.reset();
+    }
+}
+
+static void common_sampler_logit_bias_phase_reset(struct llama_sampler * smpl) {
+    auto * ctx = (common_sampler_logit_bias_phase *) smpl->ctx;
+    ctx->in_reasoning = false;
+    ctx->start_matcher.reset();
+    ctx->end_matcher.reset();
+}
+
+static struct llama_sampler * common_sampler_logit_bias_phase_clone(const struct llama_sampler * smpl) {
+    const auto * ctx = (const common_sampler_logit_bias_phase *) smpl->ctx;
+    return common_sampler_logit_bias_phase_from_ctx(*ctx);
+}
+
+static void common_sampler_logit_bias_phase_free(struct llama_sampler * smpl) {
+    delete (common_sampler_logit_bias_phase *) smpl->ctx;
+}
+
+static void common_sampler_logit_bias_phase_copy_state(const struct llama_sampler * src, struct llama_sampler * dst) {
+    ((common_sampler_logit_bias_phase *) dst->ctx)->copy_state(*(const common_sampler_logit_bias_phase *) src->ctx);
+}
+
+static void common_sampler_logit_bias_phase_backend_apply(
+        struct llama_sampler      * smpl,
+        struct ggml_context       * ctx,
+        struct ggml_cgraph        * gf,
+        struct llama_sampler_data * data) {
+    GGML_UNUSED(gf);
+
+    auto * sctx = (common_sampler_logit_bias_phase *) smpl->ctx;
+
+    const size_t n = std::max(sctx->bias_normal.size(), sctx->bias_reasoning.size());
+    if (n == 0) {
+        return;
+    }
+
+    if (sctx->inp_logit_bias == nullptr) {
+        GGML_ASSERT(sctx->inp_logit_idxs == nullptr);
+
+        sctx->inp_logit_bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n);
+        ggml_set_name(sctx->inp_logit_bias, "logit_bias_phase");
+        ggml_set_input(sctx->inp_logit_bias);
+
+        sctx->inp_logit_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
+        ggml_set_name(sctx->inp_logit_idxs, "logit_idxs_phase");
+        ggml_set_input(sctx->inp_logit_idxs);
+    }
+
+    ggml_tensor * cur = ggml_fill(ctx, data->logits, 0.0f);
+
+    cur = ggml_reshape_2d(ctx, cur, 1, ggml_nelements(cur));
+    cur = ggml_set_rows(ctx, cur, sctx->inp_logit_bias, sctx->inp_logit_idxs);
+    cur = ggml_reshape_1d(ctx, cur, ggml_nelements(cur));
+
+    data->logits = ggml_add(ctx, data->logits, cur);
+}
+
+static void common_sampler_logit_bias_phase_backend_set_input(struct llama_sampler * smpl) {
+    auto * sctx = (common_sampler_logit_bias_phase *) smpl->ctx;
+
+    const auto & bias = sctx->active();
+    const size_t n = std::max(sctx->bias_normal.size(), sctx->bias_reasoning.size());
+    if (n == 0) {
+        return;
+    }
+
+    GGML_ASSERT(sctx->inp_logit_bias != nullptr);
+    GGML_ASSERT(sctx->inp_logit_idxs != nullptr);
+
+    // pad the shorter table with zero biases so both tables fit the same input size
+    std::vector<float>   data_logit_bias(n, 0.0f);
+    std::vector<int32_t> data_logit_idxs(n, 0);
+    for (size_t i = 0; i < bias.size(); ++i) {
+        GGML_ASSERT(bias[i].token >= 0 && bias[i].token < sctx->n_vocab);
+        data_logit_bias[i] = bias[i].bias;
+        data_logit_idxs[i] = bias[i].token;
+    }
+
+    ggml_backend_tensor_set(sctx->inp_logit_bias, data_logit_bias.data(), 0, ggml_nbytes(sctx->inp_logit_bias));
+    ggml_backend_tensor_set(sctx->inp_logit_idxs, data_logit_idxs.data(), 0, ggml_nbytes(sctx->inp_logit_idxs));
+}
+
+static void common_sampler_logit_bias_phase_backend_reset(struct llama_sampler * smpl) {
+    auto * sctx = (common_sampler_logit_bias_phase *) smpl->ctx;
+    sctx->inp_logit_bias = nullptr;
+    sctx->inp_logit_idxs = nullptr;
+}
+
+static bool common_sampler_logit_bias_phase_backend_init(
+        struct llama_sampler       * smpl,
+        ggml_backend_buffer_type_t   buft,
+        uint32_t                     n_outputs_max_per_seq) {
+    GGML_UNUSED(smpl);
+    GGML_UNUSED(buft);
+    GGML_UNUSED(n_outputs_max_per_seq);
+    return true;
+}
+
+static struct llama_sampler_i common_sampler_logit_bias_phase_i = {
+    /* .name              = */ common_sampler_logit_bias_phase_name,
+    /* .accept            = */ common_sampler_logit_bias_phase_accept,
+    /* .apply             = */ common_sampler_logit_bias_phase_apply,
+    /* .reset             = */ common_sampler_logit_bias_phase_reset,
+    /* .clone             = */ common_sampler_logit_bias_phase_clone,
+    /* .free              = */ common_sampler_logit_bias_phase_free,
+    /* .backend_init      = */ common_sampler_logit_bias_phase_backend_init,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ common_sampler_logit_bias_phase_backend_apply,
+    /* .backend_set_input = */ common_sampler_logit_bias_phase_backend_set_input,
+    /* .backend_reset     = */ common_sampler_logit_bias_phase_backend_reset,
+    /* .copy_state        = */ common_sampler_logit_bias_phase_copy_state,
+};
+
+static struct llama_sampler * common_sampler_logit_bias_phase_from_ctx(const common_sampler_logit_bias_phase & ctx) {
+    return llama_sampler_init(
+        /* .iface = */ &common_sampler_logit_bias_phase_i,
+        /* .ctx   = */ new common_sampler_logit_bias_phase(ctx)
+    );
+}
+
+static struct llama_sampler * common_sampler_logit_bias_phase_init(
+        int32_t n_vocab,
+        const std::vector<llama_logit_bias> & bias_normal,
+        const std::vector<llama_logit_bias> & bias_reasoning,
+        const std::vector<llama_tokens> & start_seqs,
+        const std::vector<llama_tokens> & end_seqs) {
+    common_sampler_logit_bias_phase ctx {
+        /* .n_vocab        = */ n_vocab,
+        /* .bias_normal    = */ bias_normal,
+        /* .bias_reasoning = */ bias_reasoning,
+        /* .start_matcher  = */ common_token_matcher(start_seqs),
+        /* .end_matcher    = */ common_token_matcher(end_seqs),
+        /* .in_reasoning   = */ false,
+    };
+    return common_sampler_logit_bias_phase_from_ctx(ctx);
+}
+
 struct common_sampler * common_sampler_init(
         const struct llama_model * model,
         struct common_params_sampling & params) {
@@ -336,7 +560,26 @@ struct common_sampler * common_sampler_init(
             merged.push_back({ suppress[i], -INFINITY });
         }
 
-        if (!merged.empty()) {
+        if (!params.reasoning_logit_bias.empty()) {
+            // phase-aware logit bias: the active table is switched by tracking the
+            // reasoning start/end tags, mirroring the reasoning-budget sampler
+            std::vector<llama_logit_bias> merged_reasoning = params.reasoning_logit_bias;
+            for (int32_t i = 0; i < n_suppress; ++i) {
+                merged_reasoning.push_back({ suppress[i], -INFINITY });
+            }
+
+            if (params.reasoning_budget_start.empty() || params.reasoning_budget_end.empty()) {
+                LOG_WRN("%s: reasoning_logit_bias is set, but the reasoning start/end tag sequences are empty; the reasoning bias table will never be applied\n", __func__);
+            }
+
+            auto * lb_phase = common_sampler_logit_bias_phase_init(
+                llama_vocab_n_tokens(vocab), merged, merged_reasoning,
+                { params.reasoning_budget_start }, params.reasoning_budget_end);
+            for (const auto & token : prefill_tokens) {
+                llama_sampler_accept(lb_phase, token);
+            }
+            samplers.push_back(lb_phase);
+        } else if (!merged.empty()) {
             samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
         }
     }
