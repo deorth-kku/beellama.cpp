@@ -126,6 +126,7 @@ json task_params::to_json(bool only_metrics) const {
         {"ignore_eos",                sampling.ignore_eos},
         {"stream",                    stream},
         {"logit_bias",                format_logit_bias(sampling.logit_bias)},
+        {"reasoning_logit_bias",      format_logit_bias(sampling.reasoning_logit_bias)},
         {"n_probs",                   sampling.n_probs},
         {"min_keep",                  sampling.min_keep},
         {"grammar",                   common_grammar_value(sampling.grammar)},

@@ -278,8 +278,9 @@ struct common_params_sampling {
     std::vector<common_grammar_trigger> grammar_triggers; // optional triggers (for lazy grammars)
     std::set<llama_token>               preserved_tokens;
 
-    std::vector<llama_logit_bias> logit_bias;     // logit biases to apply
-    std::vector<llama_logit_bias> logit_bias_eog; // pre-calculated logit biases for EOG tokens
+    std::vector<llama_logit_bias> logit_bias;              // logit biases to apply
+    std::vector<llama_logit_bias> logit_bias_eog;          // pre-calculated logit biases for EOG tokens
+    std::vector<llama_logit_bias> reasoning_logit_bias;    // applied instead of logit_bias while in the reasoning phase
 
     // The assistant generation prompt already prefilled into the prompt.
     // Fed to the grammar sampler (to advance past pre-existing tokens) and used
