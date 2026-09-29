@@ -343,6 +343,9 @@ struct server_slot {
 
     common_sampler_ptr smpl;
 
+    // set once the chat parser leaves the reasoning phase; skips per-token re-parsing for reasoning_logit_bias
+    bool lb_reasoning_ended = false;
+
     llama_token sampled; // in speculative mode, this is the last accepted token
 
     // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
@@ -383,6 +386,7 @@ struct server_slot {
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
+        lb_reasoning_ended = false;
 
         task_prev = std::move(task);
         task.reset();
@@ -4243,6 +4247,21 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        // swap in the reasoning logit bias table while the parser is inside the reasoning block
+        auto update_lb_phase = [&](server_slot & slot) {
+            if (slot.task->params.sampling.reasoning_logit_bias.empty() || slot.lb_reasoning_ended) {
+                return;
+            }
+
+            auto msg = common_chat_parse(slot.generated_text, true, slot.task->params.chat_parser_params);
+            const bool in_reasoning = !msg.reasoning_content.empty() && msg.content.empty() && msg.tool_calls.empty();
+            if (!in_reasoning && (!msg.content.empty() || !msg.tool_calls.empty())) {
+                // single reasoning block assumption: once content or tool calls start, never re-parse
+                slot.lb_reasoning_ended = true;
+            }
+            common_sampler_set_reasoning_phase(slot.smpl.get(), in_reasoning);
+        };
+
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
@@ -4294,6 +4313,8 @@ private:
             if (slot.can_speculate() && !slot.spec_draft.empty()) {
                 return; // sample using speculative decoding
             }
+
+            update_lb_phase(slot);
 
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
@@ -4348,6 +4369,8 @@ private:
                     slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
                 return;
             }
+
+            update_lb_phase(slot);
 
             // save the original draft size
             const size_t n_draft = slot.spec_draft.size();

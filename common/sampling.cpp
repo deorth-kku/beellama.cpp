@@ -116,6 +116,9 @@ struct common_sampler {
     struct llama_sampler * rbudget;
     struct llama_sampler * chain;
 
+    // index of the phase-aware logit bias sampler in the chain, -1 if not present
+    int32_t lb_phase_idx = -1;
+
     ring_buffer<llama_token> prev;
 
     std::vector<llama_token_data> cur;
@@ -186,6 +189,191 @@ std::string common_params_sampling::print() const {
             mirostat, mirostat_eta, mirostat_tau, adaptive_target, adaptive_decay);
 
     return std::string(result);
+}
+
+// logit bias with two tables, one per generation phase (reasoning vs normal)
+// the server swaps the active table at runtime via common_sampler_set_reasoning_phase()
+struct common_sampler_logit_bias_phase {
+    const int32_t n_vocab;
+
+    const std::vector<llama_logit_bias> bias_normal;
+    const std::vector<llama_logit_bias> bias_reasoning;
+
+    bool in_reasoning = false;
+
+    std::vector<llama_logit_bias> to_search;
+
+    struct ggml_tensor * inp_logit_bias = nullptr;
+    struct ggml_tensor * inp_logit_idxs = nullptr;
+
+    const std::vector<llama_logit_bias> & active() const {
+        return in_reasoning ? bias_reasoning : bias_normal;
+    }
+
+    void copy_state(const common_sampler_logit_bias_phase & src) {
+        in_reasoning = src.in_reasoning;
+    }
+};
+
+static struct llama_sampler * common_sampler_logit_bias_phase_init(
+        int32_t n_vocab,
+        const std::vector<llama_logit_bias> & bias_normal,
+        const std::vector<llama_logit_bias> & bias_reasoning,
+        bool in_reasoning);
+
+static const char * common_sampler_logit_bias_phase_name(const struct llama_sampler * smpl) {
+    GGML_UNUSED(smpl);
+    return "logit-bias-phase";
+}
+
+static void common_sampler_logit_bias_phase_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    auto * ctx = (common_sampler_logit_bias_phase *) smpl->ctx;
+
+    const auto & bias = ctx->active();
+    if (bias.empty()) {
+        return;
+    }
+
+    ctx->to_search.clear();
+
+    // update the candidates that have not been shuffled in the vocabulary (i.e. idx == id)
+    for (const auto & lb : bias) {
+        if (lb.token >= 0 && cur_p->size > (size_t) lb.token && cur_p->data[lb.token].id == lb.token) {
+            cur_p->data[lb.token].logit += lb.bias;
+        } else {
+            ctx->to_search.push_back(lb);
+        }
+    }
+
+    // search for the remaining candidates that were not found in the previous step
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        for (const auto & lb : ctx->to_search) {
+            if (cur_p->data[i].id == lb.token) {
+                cur_p->data[i].logit += lb.bias;
+                break;
+            }
+        }
+    }
+}
+
+static struct llama_sampler * common_sampler_logit_bias_phase_clone(const struct llama_sampler * smpl) {
+    const auto * ctx = (const common_sampler_logit_bias_phase *) smpl->ctx;
+    return common_sampler_logit_bias_phase_init(ctx->n_vocab, ctx->bias_normal, ctx->bias_reasoning, ctx->in_reasoning);
+}
+
+static void common_sampler_logit_bias_phase_free(struct llama_sampler * smpl) {
+    delete (common_sampler_logit_bias_phase *) smpl->ctx;
+}
+
+static void common_sampler_logit_bias_phase_copy_state(const struct llama_sampler * src, struct llama_sampler * dst) {
+    ((common_sampler_logit_bias_phase *) dst->ctx)->copy_state(*(const common_sampler_logit_bias_phase *) src->ctx);
+}
+
+static void common_sampler_logit_bias_phase_backend_apply(
+        struct llama_sampler      * smpl,
+        struct ggml_context       * ctx,
+        struct ggml_cgraph        * gf,
+        struct llama_sampler_data * data) {
+    GGML_UNUSED(gf);
+
+    auto * sctx = (common_sampler_logit_bias_phase *) smpl->ctx;
+
+    const size_t n = std::max(sctx->bias_normal.size(), sctx->bias_reasoning.size());
+    if (n == 0) {
+        return;
+    }
+
+    if (sctx->inp_logit_bias == nullptr) {
+        GGML_ASSERT(sctx->inp_logit_idxs == nullptr);
+
+        sctx->inp_logit_bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n);
+        ggml_set_name(sctx->inp_logit_bias, "logit_bias_phase");
+        ggml_set_input(sctx->inp_logit_bias);
+
+        sctx->inp_logit_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
+        ggml_set_name(sctx->inp_logit_idxs, "logit_idxs_phase");
+        ggml_set_input(sctx->inp_logit_idxs);
+    }
+
+    ggml_tensor * cur = ggml_fill(ctx, data->logits, 0.0f);
+
+    cur = ggml_reshape_2d(ctx, cur, 1, ggml_nelements(cur));
+    cur = ggml_set_rows(ctx, cur, sctx->inp_logit_bias, sctx->inp_logit_idxs);
+    cur = ggml_reshape_1d(ctx, cur, ggml_nelements(cur));
+
+    data->logits = ggml_add(ctx, data->logits, cur);
+}
+
+static void common_sampler_logit_bias_phase_backend_set_input(struct llama_sampler * smpl) {
+    auto * sctx = (common_sampler_logit_bias_phase *) smpl->ctx;
+
+    const auto & bias = sctx->active();
+    const size_t n = std::max(sctx->bias_normal.size(), sctx->bias_reasoning.size());
+    if (n == 0) {
+        return;
+    }
+
+    GGML_ASSERT(sctx->inp_logit_bias != nullptr);
+    GGML_ASSERT(sctx->inp_logit_idxs != nullptr);
+
+    // pad the shorter table with zero biases so both tables fit the same input size
+    std::vector<float>   data_logit_bias(n, 0.0f);
+    std::vector<int32_t> data_logit_idxs(n, 0);
+    for (size_t i = 0; i < bias.size(); ++i) {
+        GGML_ASSERT(bias[i].token >= 0 && bias[i].token < sctx->n_vocab);
+        data_logit_bias[i] = bias[i].bias;
+        data_logit_idxs[i] = bias[i].token;
+    }
+
+    ggml_backend_tensor_set(sctx->inp_logit_bias, data_logit_bias.data(), 0, ggml_nbytes(sctx->inp_logit_bias));
+    ggml_backend_tensor_set(sctx->inp_logit_idxs, data_logit_idxs.data(), 0, ggml_nbytes(sctx->inp_logit_idxs));
+}
+
+static void common_sampler_logit_bias_phase_backend_reset(struct llama_sampler * smpl) {
+    auto * sctx = (common_sampler_logit_bias_phase *) smpl->ctx;
+    sctx->inp_logit_bias = nullptr;
+    sctx->inp_logit_idxs = nullptr;
+}
+
+static bool common_sampler_logit_bias_phase_backend_init(
+        struct llama_sampler       * smpl,
+        ggml_backend_buffer_type_t   buft,
+        uint32_t                     n_outputs_max_per_seq) {
+    GGML_UNUSED(smpl);
+    GGML_UNUSED(buft);
+    GGML_UNUSED(n_outputs_max_per_seq);
+    return true;
+}
+
+static struct llama_sampler_i common_sampler_logit_bias_phase_i = {
+    /* .name              = */ common_sampler_logit_bias_phase_name,
+    /* .accept            = */ nullptr,
+    /* .apply             = */ common_sampler_logit_bias_phase_apply,
+    /* .reset             = */ nullptr,
+    /* .clone             = */ common_sampler_logit_bias_phase_clone,
+    /* .free              = */ common_sampler_logit_bias_phase_free,
+    /* .backend_init      = */ common_sampler_logit_bias_phase_backend_init,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ common_sampler_logit_bias_phase_backend_apply,
+    /* .backend_set_input = */ common_sampler_logit_bias_phase_backend_set_input,
+    /* .backend_reset     = */ common_sampler_logit_bias_phase_backend_reset,
+    /* .copy_state        = */ common_sampler_logit_bias_phase_copy_state,
+};
+
+static struct llama_sampler * common_sampler_logit_bias_phase_init(
+        int32_t n_vocab,
+        const std::vector<llama_logit_bias> & bias_normal,
+        const std::vector<llama_logit_bias> & bias_reasoning,
+        bool in_reasoning) {
+    return llama_sampler_init(
+        /* .iface = */ &common_sampler_logit_bias_phase_i,
+        /* .ctx   = */ new common_sampler_logit_bias_phase {
+            /* .n_vocab        = */ n_vocab,
+            /* .bias_normal    = */ bias_normal,
+            /* .bias_reasoning = */ bias_reasoning,
+            /* .in_reasoning   = */ in_reasoning,
+        }
+    );
 }
 
 struct common_sampler * common_sampler_init(
@@ -327,6 +515,7 @@ struct common_sampler * common_sampler_init(
     }
 
     // logit bias: user biases + model suppress tokens (-INFINITY)
+    int32_t lb_phase_idx = -1;
     {
         std::vector<llama_logit_bias> merged = params.logit_bias;
 
@@ -336,7 +525,16 @@ struct common_sampler * common_sampler_init(
             merged.push_back({ suppress[i], -INFINITY });
         }
 
-        if (!merged.empty()) {
+        if (!params.reasoning_logit_bias.empty()) {
+            // phase-aware logit bias: the server swaps in the reasoning table while in the reasoning phase
+            std::vector<llama_logit_bias> merged_reasoning = params.reasoning_logit_bias;
+            for (int32_t i = 0; i < n_suppress; ++i) {
+                merged_reasoning.push_back({ suppress[i], -INFINITY });
+            }
+
+            lb_phase_idx = (int32_t) samplers.size();
+            samplers.push_back(common_sampler_logit_bias_phase_init(llama_vocab_n_tokens(vocab), merged, merged_reasoning, false));
+        } else if (!merged.empty()) {
             samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
         }
     }
@@ -429,15 +627,16 @@ struct common_sampler * common_sampler_init(
     }
 
     auto * result = new common_sampler {
-        /* .params  = */ params,
-        /* .grmr    = */ grmr,
-        /* .rbudget = */ rbudget,
-        /* .chain   = */ chain,
-        /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
-        /* .cur     = */ {},
-        /* .cur_p   = */ {},
+        /* .params       = */ params,
+        /* .grmr         = */ grmr,
+        /* .rbudget      = */ rbudget,
+        /* .chain        = */ chain,
+        /* .lb_phase_idx = */ lb_phase_idx,
+        /* .prev         = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
+        /* .cur          = */ {},
+        /* .cur_p        = */ {},
         // mix it, the chain and the draft are seeded from this one too
-        /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+        /* .rng          = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
 
     return result;
@@ -514,14 +713,15 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
-        /* .params  = */ gsmpl->params,
-        /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
-        /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
-        /* .chain   = */ llama_sampler_clone(gsmpl->chain),
-        /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
-        /* .rng     = */ gsmpl->rng,
+        /* .params       = */ gsmpl->params,
+        /* .grmr         = */ llama_sampler_clone(gsmpl->grmr),
+        /* .rbudget      = */ llama_sampler_clone(gsmpl->rbudget),
+        /* .chain        = */ llama_sampler_clone(gsmpl->chain),
+        /* .lb_phase_idx = */ gsmpl->lb_phase_idx,
+        /* .prev         = */ gsmpl->prev,
+        /* .cur          = */ gsmpl->cur,
+        /* .cur_p        = */ gsmpl->cur_p,
+        /* .rng          = */ gsmpl->rng,
     };
 }
 
@@ -532,6 +732,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
 
     GGML_ASSERT((src->grmr == nullptr) == (dst->grmr == nullptr));
     GGML_ASSERT((src->rbudget == nullptr) == (dst->rbudget == nullptr));
+    GGML_ASSERT(src->lb_phase_idx == dst->lb_phase_idx);
 
     llama_sampler_copy(src->grmr,    dst->grmr);
     llama_sampler_copy(src->rbudget, dst->rbudget);
@@ -854,6 +1055,17 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
     }
 
     return common_reasoning_budget_force(gsmpl->rbudget);
+}
+
+void common_sampler_set_reasoning_phase(struct common_sampler * gsmpl, bool in_reasoning) {
+    if (!gsmpl || gsmpl->lb_phase_idx < 0) {
+        return;
+    }
+
+    auto * smpl = llama_sampler_chain_get(gsmpl->chain, gsmpl->lb_phase_idx);
+    GGML_ASSERT(smpl != nullptr);
+
+    ((common_sampler_logit_bias_phase *) smpl->ctx)->in_reasoning = in_reasoning;
 }
 
 // helpers
