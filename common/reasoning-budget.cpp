@@ -11,49 +11,11 @@
 #include <string>
 #include <vector>
 
-struct token_matcher {
-    std::vector<llama_tokens> seqs;
-    common_aho_corasick ac;
-    size_t state = 0;
-
-    token_matcher(const std::vector<llama_tokens> & seqs) : seqs(collect(seqs)), ac(build_trie(this->seqs)) {}
-
-    static std::vector<llama_tokens> collect(const std::vector<llama_tokens> & seqs) {
-        std::vector<llama_tokens> res;
-        for (const auto & seq : seqs) {
-            if (!seq.empty() && std::find(res.begin(), res.end(), seq) == res.end()) {
-                res.push_back(seq);
-            }
-        }
-        return res;
-    }
-
-    static common_trie build_trie(const std::vector<llama_tokens> & seqs) {
-        common_trie t;
-        for (const auto & seq : seqs) {
-            t.insert(std::vector<uint32_t>(seq.begin(), seq.end()));
-        }
-        return t;
-    }
-
-    // returns the index into seqs of the longest sequence ending at this token, or -1
-    int32_t advance(llama_token token) {
-        state = ac.next(state, (uint32_t) token);
-        const int32_t p = ac.match_pattern(state);
-        if (p >= 0) {
-            state = 0;
-        }
-        return p;
-    }
-
-    void reset() { state = 0; }
-};
-
 struct common_reasoning_budget_ctx {
     const llama_vocab * vocab;
 
-    token_matcher start_matcher;
-    token_matcher end_matcher;
+    common_token_matcher start_matcher;
+    common_token_matcher end_matcher;
     llama_tokens forced_tokens;
 
     int32_t budget;           // maximum tokens in reasoning block
@@ -246,8 +208,8 @@ static struct llama_sampler * common_reasoning_budget_init_state(
         /* .iface = */ &common_reasoning_budget_i,
         /* .ctx   = */ new common_reasoning_budget_ctx {
             /* .vocab         = */ vocab,
-            /* .start_matcher = */ token_matcher(start_seqs),
-            /* .end_matcher   = */ token_matcher(end_seqs),
+            /* .start_matcher = */ common_token_matcher(start_seqs),
+            /* .end_matcher   = */ common_token_matcher(end_seqs),
             /* .forced_tokens = */ forced_tokens,
             /* .budget        = */ budget,
             /* .remaining     = */ budget,

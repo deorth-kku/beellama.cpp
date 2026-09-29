@@ -420,6 +420,47 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             }
         }));
 
+    add((new field_json("reasoning_logit_bias"))
+        ->set_desc("Like logit_bias, but applied only while the model is in the reasoning phase; logit_bias is applied for the rest of the output")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_ASSERT(ctx.vocab != nullptr);
+            ctx.params.sampling.reasoning_logit_bias.clear();
+            const auto & reasoning_logit_bias = data.at("reasoning_logit_bias");
+            const int n_vocab = llama_vocab_n_tokens(ctx.vocab);
+            auto parse_bias = [](const json & v, float & bias) -> bool {
+                if (v.is_number())                        { bias = v.get<float>(); return true; }
+                if (v.is_boolean() && !v.get<bool>())     { bias = -INFINITY;      return true; }
+                return false;
+            };
+            if (reasoning_logit_bias.is_array()) {
+                for (const auto & el : reasoning_logit_bias) {
+                    if (!el.is_array() || el.size() != 2) continue;
+                    float bias;
+                    if (!parse_bias(el[1], bias)) continue;
+                    if (el[0].is_number_integer()) {
+                        llama_token tok = el[0].get<llama_token>();
+                        if (tok >= 0 && tok < n_vocab) ctx.params.sampling.reasoning_logit_bias.push_back({tok, bias});
+                    } else if (el[0].is_string()) {
+                        for (auto tok : common_tokenize(ctx.vocab, el[0].get<std::string>(), false))
+                            ctx.params.sampling.reasoning_logit_bias.push_back({tok, bias});
+                    }
+                }
+            } else if (reasoning_logit_bias.is_object()) {
+                for (const auto & el : reasoning_logit_bias.items()) {
+                    float bias;
+                    if (!parse_bias(el.value(), bias)) continue;
+                    char * end;
+                    llama_token tok = strtol(el.key().c_str(), &end, 10);
+                    if (*end == 0) {
+                        if (tok >= 0 && tok < n_vocab) ctx.params.sampling.reasoning_logit_bias.push_back({tok, bias});
+                    } else {
+                        for (auto t : common_tokenize(ctx.vocab, el.key(), false))
+                            ctx.params.sampling.reasoning_logit_bias.push_back({t, bias});
+                    }
+                }
+            }
+        }));
+
     add((new field_bool("ignore_eos", params.sampling.ignore_eos))
         ->set_desc("Ignore the end-of-sequence token and continue generating")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
