@@ -96,10 +96,6 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 
-// select the active logit bias table of the phase-aware logit bias sampler (if any).
-// no-op when the sampler was not created (i.e. no reasoning_logit_bias was configured)
-void common_sampler_set_reasoning_phase(struct common_sampler * gsmpl, bool in_reasoning);
-
 // helpers
 
 // access the internal list of current candidate tokens
