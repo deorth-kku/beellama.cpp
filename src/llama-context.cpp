@@ -4189,6 +4189,16 @@ void llama_memory_seq_cp(
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
+bool llama_memory_seq_is_shared(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (!mem) {
+        return false;
+    }
+
+    return mem->seq_is_shared(seq_id);
+}
+
 void llama_memory_seq_keep(
         llama_memory_t mem,
           llama_seq_id seq_id) {

@@ -778,6 +778,12 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Returns true if any cell owned by the specified sequence is also owned by another sequence
+    // (i.e. the sequence shares cells via llama_memory_seq_cp)
+    LLAMA_API bool llama_memory_seq_is_shared(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
     // Removes all tokens that do not belong to the specified sequence
     LLAMA_API void llama_memory_seq_keep(
             llama_memory_t mem,

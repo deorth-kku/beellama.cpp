@@ -124,6 +124,10 @@ void llama_kv_cache_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     kv_swa ->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
+bool llama_kv_cache_iswa::seq_is_shared(llama_seq_id seq_id) const {
+    return kv_base->seq_is_shared(seq_id) || kv_swa->seq_is_shared(seq_id);
+}
+
 void llama_kv_cache_iswa::seq_keep(llama_seq_id seq_id) {
     kv_base->seq_keep(seq_id);
     kv_swa ->seq_keep(seq_id);

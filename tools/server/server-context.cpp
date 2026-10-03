@@ -1385,6 +1385,11 @@ private:
             }
         }
 
+        if (params_base.n_prefix_share && !params_base.kv_unified) {
+            params_base.n_prefix_share = 0;
+            SRV_WRN("%s\n", "prefix_share requires --kv-unified, it will be disabled");
+        }
+
         if (llama_model_n_swa(model_tgt) == 0) {
             if (params_base.swa_full) {
                 params_base.swa_full = false;
@@ -3308,6 +3313,12 @@ private:
                     return;
                 }
 
+                if (slot.mem.seq_is_shared(slot.id)) {
+                    send_error(slot, "context shift cannot be used with shared prefix cells", ERROR_TYPE_SERVER);
+                    slot.release();
+                    return;
+                }
+
                 // Shift context
                 int n_keep = slot.task->params.n_keep < 0 ? slot.task->n_tokens() : slot.task->params.n_keep;
 
@@ -3639,7 +3650,9 @@ private:
                                 }
 
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
-                                if (can_cache_reuse && n_cache_reuse > 0) {
+                                // skip when the slot shares cells with another sequence: in-place KV shifting
+                                //   would corrupt the other owner's cells (see --prefix-share)
+                                if (can_cache_reuse && n_cache_reuse > 0 && !slot.mem.seq_is_shared(slot.id)) {
                                     GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
 
                                     size_t head_c = n_past; // cache
@@ -3690,6 +3703,63 @@ private:
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
+                            }
+
+                            // cross-slot common-prefix sharing: alias a live donor slot's cells
+                            // instead of re-prefilling the shared prefix (requires --kv-unified)
+                            // only when n_past == 0: the slot holds no reusable prefix of its own, so
+                            //   any stale data it carries is discarded here and the prefix can be
+                            //   aliased as if the slot were fresh
+                            if (n_past == 0 && slot.task->params.n_prefix_share > 0 && params_base.kv_unified) {
+                                // a reused slot may still hold a previous prompt; drop it so the
+                                //   aliased prefix starts from position 0 (the old cells are owned
+                                //   only by this slot, so this does not touch the donor's cells)
+                                if (!slot.prompt.tokens.empty()) {
+                                    slot.prompt.clear();
+                                    slot.mem.seq_rm(slot.id, 0, -1);
+                                }
+
+                                server_slot * donor = nullptr;
+                                int n_shared = 0;
+
+                                iterate(slots, [&](server_slot & other) {
+                                    if (&other == &slot) {
+                                        return;
+                                    }
+                                    if (!other.is_processing() || other.truncated) {
+                                        return;
+                                    }
+                                    if (other.state == SLOT_STATE_WAIT_OTHER || other.prompt.tokens.empty()) {
+                                        return;
+                                    }
+
+                                    int cand = (int) other.prompt.tokens.get_common_prefix(input_tokens);
+                                    cand = std::min(cand, (int) other.prompt.tokens.size());
+                                    cand = std::min(cand, (int) input_tokens.size() - 1); // keep >= 1 token to evaluate
+
+                                    if (cand < slot.task->params.n_prefix_share || cand <= n_shared) {
+                                        return;
+                                    }
+
+                                    // donor prefix cells must sit at positions [0, cand) (not shifted)
+                                    const llama_pos pmin = other.mem.seq_pos_min(other.id);
+                                    const llama_pos pmax = other.mem.seq_pos_max(other.id);
+                                    if (pmin > 0 || pmax < cand - 1) {
+                                        return;
+                                    }
+
+                                    donor = &other;
+                                    n_shared = cand;
+                                });
+
+                                if (donor) {
+                                    const auto in_toks = input_tokens.get_tokens();
+                                    const llama_tokens prefix(in_toks.begin(), in_toks.begin() + n_shared);
+                                    slot.prompt.tokens.insert(prefix);
+                                    slot.mem.seq_cp(donor->id, slot.id, 0, n_shared);
+                                    n_past = n_shared;
+                                    SLT_TRC(slot, "sharing %d prefix cells from slot %d (n_past = %d)\n", n_shared, donor->id, n_past);
+                                }
                             }
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);

@@ -339,7 +339,7 @@ llama_kv_cache::llama_kv_cache(
     }
 
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
-    LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
+    LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_v_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
 
     // pre-compute the haramard matrices and keep them in host memory
     // TODO: in the future, we can make copies in the backend buffers to avoid host -> device transfers
@@ -680,6 +680,24 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
     const auto & cells = v_cells[seq_to_stream[seq_id]];
 
     return cells.seq_pos_max(seq_id);
+}
+
+bool llama_kv_cache::seq_is_shared(llama_seq_id seq_id) const {
+    if (other) {
+        return other->seq_is_shared(seq_id);
+    }
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.seq_has(i, seq_id) && cells.seq_count(i) > 1) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
