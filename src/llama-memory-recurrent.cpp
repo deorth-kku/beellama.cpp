@@ -415,6 +415,20 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     return result;
 }
 
+bool llama_memory_recurrent::seq_is_shared(llama_seq_id seq_id) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= size) {
+        return false;
+    }
+
+    const int32_t tail_id = cells[seq_id].tail;
+    if (tail_id < 0) {
+        return false;
+    }
+
+    // the state is shared when the tail cell carries more than one sequence
+    return cells[tail_id].seq_id.size() > 1;
+}
+
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     if (seq_id < 0) {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);

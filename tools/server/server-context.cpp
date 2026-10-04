@@ -3724,6 +3724,10 @@ private:
                                 SLT_DBG(slot, "prefix-share: scanning donors, n_past = %d, n_prefix_share = %d, task.n_tokens = %d\n",
                                         n_past, slot.task->params.n_prefix_share, slot.task->n_tokens());
 
+                                // media chunks cannot be aliased via seq_cp: the donor built its KV
+                                // from text, so the shared prefix must be pure text
+                                const size_t n_text = slot.task->tokens.get_text_tokens().size();
+
                                 for (auto & other : slots) {
                                     if (&other == &slot) {
                                         continue;
@@ -3744,12 +3748,14 @@ private:
                                         continue;
                                     }
 
-                                    // the donor prefix must sit at positions [0, n) and be in the cache
-                                    const auto pos_min = other.mem.seq_pos_min(other.id);
+                                    // the donor prefix must be live: it has processed at least one token, and
+                                    // (non-SWA) the attention cache is contiguous [0, pos_max]. we do NOT require
+                                    // pos_min == 0, because a hybrid (recurrent) model reports pos_min == pos_max
+                                    // (the recurrent state only exists at the latest position)
                                     const auto pos_max = other.mem.seq_pos_max(other.id);
-                                    if (pos_min != 0 || pos_max < 0) {
-                                        SLT_DBG(slot, "prefix-share: reject slot %d (pos_min = %d, pos_max = %d)\n",
-                                                other.id, (int) pos_min, (int) pos_max);
+                                    if (pos_max < 0) {
+                                        SLT_DBG(slot, "prefix-share: reject slot %d (pos_max = %d)\n",
+                                                other.id, (int) pos_max);
                                         continue;
                                     }
 
@@ -3759,6 +3765,23 @@ private:
                                         lcp,
                                         std::min((int) other.prompt.n_tokens(),
                                                  std::min(slot.task->n_tokens() - 1, (int) pos_max + 1)));
+
+                                    // a hybrid (recurrent) model only holds its state at pos_max, so the shared
+                                    // prefix must reach exactly pos_max + 1; a shorter prefix has no recurrent
+                                    // state to alias (seq_cp would point the new slot at the wrong position)
+                                    if (n_cur != pos_max + 1) {
+                                        SLT_DBG(slot, "prefix-share: reject slot %d (n_cur = %d, pos_max + 1 = %d)\n",
+                                                other.id, n_cur, (int) pos_max + 1);
+                                        continue;
+                                    }
+
+                                    // a media chunk inside the shared prefix would be skipped, but the
+                                    // donor's KV there comes from text - reject
+                                    if (n_text < (size_t) n_cur) {
+                                        SLT_DBG(slot, "prefix-share: reject slot %d (media chunk in shared prefix, n_text = %zu, n_cur = %d)\n",
+                                                other.id, n_text, n_cur);
+                                        continue;
+                                    }
 
                                     SLT_DBG(slot, "prefix-share: slot %d candidate (lcp = %d, donor.n_tokens = %d, pos_max = %d, n_cur = %d)\n",
                                             other.id, lcp, (int) other.prompt.n_tokens(), (int) pos_max, n_cur);
@@ -3787,7 +3810,9 @@ private:
                                     // alias the donor's whole prefix, then continue from the shared prefix
                                     slot.mem.seq_cp(donor->id, slot.id, 0, n_shared);
 
-                                    llama_tokens prefix = slot.task->tokens.get_tokens();
+                                    // get_text_tokens() is safe with mtmd enabled; get_tokens() asserts
+                                    // the task has no media at all
+                                    llama_tokens prefix = slot.task->tokens.get_text_tokens();
                                     prefix.resize(n_shared);
                                     slot.prompt.tokens.insert(prefix);
 
