@@ -1608,6 +1608,32 @@ void common_memory::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, lla
     }
 }
 
+bool common_memory::seq_is_shared(llama_seq_id seq_id) const {
+    if (llama_memory_seq_is_shared(llama_get_memory(ctx_tgt), seq_id)) {
+        return true;
+    }
+    if (ctx_dft) {
+        return llama_memory_seq_is_shared(llama_get_memory(ctx_dft), seq_id);
+    }
+    return false;
+}
+
+llama_pos common_memory::seq_pos_min(llama_seq_id seq_id) const {
+    llama_pos res = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), seq_id);
+    if (ctx_dft) {
+        res = std::min(res, llama_memory_seq_pos_min(llama_get_memory(ctx_dft), seq_id));
+    }
+    return res;
+}
+
+llama_pos common_memory::seq_pos_max(llama_seq_id seq_id) const {
+    llama_pos res = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), seq_id);
+    if (ctx_dft) {
+        res = std::max(res, llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id));
+    }
+    return res;
+}
+
 void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const {
     common_context_seq_add(ctx_tgt, seq_id, p0, p1, delta);
     if (ctx_dft) {

@@ -1385,6 +1385,11 @@ private:
             }
         }
 
+        if (params_base.n_prefix_share > 0 && !params_base.kv_unified) {
+            params_base.n_prefix_share = 0;
+            SRV_WRN("%s\n", "prefix_share is not supported without --kv-unified, it will be disabled");
+        }
+
         if (llama_model_n_swa(model_tgt) == 0) {
             if (params_base.swa_full) {
                 params_base.swa_full = false;
@@ -3308,6 +3313,13 @@ private:
                     return;
                 }
 
+                // shifting would move the KV cells in place, corrupting the other owner
+                if (slot.mem.seq_is_shared(slot.id)) {
+                    send_error(slot, "context shift cannot be used for shared prompt", ERROR_TYPE_SERVER);
+                    slot.release();
+                    return;
+                }
+
                 // Shift context
                 int n_keep = slot.task->params.n_keep < 0 ? slot.task->n_tokens() : slot.task->params.n_keep;
 
@@ -3630,9 +3642,11 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
+                                // shifting KV cells in place would corrupt the other owner of a shared cell
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    !slot.prompt.tokens.has_mtmd &&
+                                    !slot.mem.seq_is_shared(slot.id);
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
@@ -3690,6 +3704,98 @@ private:
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
+                            }
+
+                            // share the prompt prefix with another live slot: alias its KV cells
+                            // instead of re-prefilling them, only possible with a unified cache
+                            const bool ps_enabled = slot.task->params.n_prefix_share > 0;
+                            const bool ps_gate = params_base.kv_unified && n_swa == 0 && ps_enabled;
+
+                            if (ps_enabled && !ps_gate) {
+                                // log why sharing was skipped so a verbose run can pinpoint the cause
+                                SLT_INF(slot, "prefix-share skipped: kv_unified = %d, n_swa = %d, n_prefix_share = %d\n",
+                                        (int) params_base.kv_unified, n_swa, slot.task->params.n_prefix_share);
+                            }
+
+                            if (ps_gate) {
+                                int n_shared = 0;
+                                server_slot * donor = nullptr;
+
+                                SLT_DBG(slot, "prefix-share: scanning donors, n_past = %d, n_prefix_share = %d, task.n_tokens = %d\n",
+                                        n_past, slot.task->params.n_prefix_share, slot.task->n_tokens());
+
+                                for (auto & other : slots) {
+                                    if (&other == &slot) {
+                                        continue;
+                                    }
+
+                                    const bool state_ok =
+                                        other.state == SLOT_STATE_PROCESSING_PROMPT ||
+                                        other.state == SLOT_STATE_DONE_PROMPT ||
+                                        other.state == SLOT_STATE_GENERATING;
+                                    if (!state_ok) {
+                                        continue;
+                                    }
+
+                                    if (!other.task || other.truncated ||
+                                        other.task->is_parent() || other.task->is_child()) {
+                                        SLT_DBG(slot, "prefix-share: reject slot %d (no task / truncated / parent / child)\n",
+                                                other.id);
+                                        continue;
+                                    }
+
+                                    // the donor prefix must sit at positions [0, n) and be in the cache
+                                    const auto pos_min = other.mem.seq_pos_min(other.id);
+                                    const auto pos_max = other.mem.seq_pos_max(other.id);
+                                    if (pos_min != 0 || pos_max < 0) {
+                                        SLT_DBG(slot, "prefix-share: reject slot %d (pos_min = %d, pos_max = %d)\n",
+                                                other.id, (int) pos_min, (int) pos_max);
+                                        continue;
+                                    }
+
+                                    // at least one token must be evaluated by the new slot
+                                    const int lcp = (int) other.prompt.tokens.get_common_prefix(slot.task->tokens);
+                                    const int n_cur = std::min(
+                                        lcp,
+                                        std::min((int) other.prompt.n_tokens(),
+                                                 std::min(slot.task->n_tokens() - 1, (int) pos_max + 1)));
+
+                                    SLT_DBG(slot, "prefix-share: slot %d candidate (lcp = %d, donor.n_tokens = %d, pos_max = %d, n_cur = %d)\n",
+                                            other.id, lcp, (int) other.prompt.n_tokens(), (int) pos_max, n_cur);
+
+                                    if (n_cur > n_shared) {
+                                        n_shared = n_cur;
+                                        donor = &other;
+                                    }
+                                }
+
+                                // share only when the donor offers more than this slot already cached
+                                const bool do_share = donor &&
+                                    n_shared >= slot.task->params.n_prefix_share && n_shared > n_past;
+
+                                if (do_share) {
+                                    SLT_INF(slot, "sharing prompt prefix with slot %d (n_shared = %d, own n_past = %d)\n",
+                                            donor->id, n_shared, n_past);
+
+                                    // drop this slot's own cells (its [0, n_past) KV is identical to the
+                                    // donor's, so reusing the donor's cells frees the slot's duplicate VRAM)
+                                    if (!slot.prompt.tokens.empty()) {
+                                        slot.prompt.clear();
+                                    }
+                                    slot.mem.seq_rm(slot.id, 0, -1);
+
+                                    // alias the donor's whole prefix, then continue from the shared prefix
+                                    slot.mem.seq_cp(donor->id, slot.id, 0, n_shared);
+
+                                    llama_tokens prefix = slot.task->tokens.get_tokens();
+                                    prefix.resize(n_shared);
+                                    slot.prompt.tokens.insert(prefix);
+
+                                    n_past = n_shared;
+                                } else {
+                                    SLT_INF(slot, "prefix-share: no usable donor (best n_shared = %d, n_past = %d, threshold = %d)\n",
+                                            n_shared, n_past, slot.task->params.n_prefix_share);
+                                }
                             }
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
