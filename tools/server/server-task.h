@@ -65,6 +65,7 @@ struct task_params {
 
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
     int32_t n_prefix_share = 0; // min shared prompt prefix length to alias KV cells from another slot (0 = disabled)
+    int32_t n_prefix_share_wait = 0; // max ms to wait for a donor to prefill the shared prefix before aliasing (0 = disabled)
 
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit

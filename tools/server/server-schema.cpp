@@ -575,6 +575,7 @@ task_params eval_llama_cmpl_schema(
     params.n_predict     = params_base.n_predict;
     params.n_cache_reuse = params_base.n_cache_reuse;
     params.n_prefix_share = params_base.n_prefix_share;
+    params.n_prefix_share_wait = params_base.n_prefix_share_wait;
     params.cache_prompt  = params_base.cache_prompt;
     params.antiprompt    = params_base.antiprompt;
     params.sse_ping_interval = params_base.sse_ping_interval;
