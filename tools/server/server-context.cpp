@@ -3707,19 +3707,24 @@ private:
                             }
 
                             // share the prompt prefix with another live slot: alias its KV cells
-                            // instead of re-prefilling them, only possible with a unified cache
+                            // instead of re-prefilling them, only possible with a unified cache.
+                            // SWA is fine: old cells are masked, not freed, so the donor's prefix
+                            // stays alive and each slot's SWA window slides independently
                             const bool ps_enabled = slot.task->params.n_prefix_share > 0;
-                            const bool ps_gate = params_base.kv_unified && n_swa == 0 && ps_enabled;
+                            const bool ps_gate = params_base.kv_unified && ps_enabled;
 
                             if (ps_enabled && !ps_gate) {
                                 // log why sharing was skipped so a verbose run can pinpoint the cause
-                                SLT_INF(slot, "prefix-share skipped: kv_unified = %d, n_swa = %d, n_prefix_share = %d\n",
-                                        (int) params_base.kv_unified, n_swa, slot.task->params.n_prefix_share);
+                                SLT_INF(slot, "prefix-share skipped: kv_unified = %d, n_prefix_share = %d\n",
+                                        (int) params_base.kv_unified, slot.task->params.n_prefix_share);
                             }
 
                             if (ps_gate) {
                                 int n_shared = 0;
                                 server_slot * donor = nullptr;
+
+                                // a recurrent model only holds its state at the latest position
+                                const bool has_recurrent = llama_model_is_recurrent(llama_get_model(ctx_tgt));
 
                                 SLT_DBG(slot, "prefix-share: scanning donors, n_past = %d, n_prefix_share = %d, task.n_tokens = %d\n",
                                         n_past, slot.task->params.n_prefix_share, slot.task->n_tokens());
@@ -3762,10 +3767,10 @@ private:
                                         std::min((int) other.prompt.n_tokens(),
                                                  std::min(slot.task->n_tokens() - 1, (int) pos_max + 1)));
 
-                                    // a hybrid (recurrent) model only holds its state at pos_max, so the shared
-                                    // prefix must reach exactly pos_max + 1; a shorter prefix has no recurrent
-                                    // state to alias (seq_cp would point the new slot at the wrong position)
-                                    if (n_cur != pos_max + 1) {
+                                    // a recurrent model only holds its state at pos_max, so the shared
+                                    // prefix must reach exactly pos_max + 1; an attention-only model
+                                    // has KV at every position, so any prefix length works
+                                    if (has_recurrent && n_cur != pos_max + 1) {
                                         SLT_DBG(slot, "prefix-share: reject slot %d (n_cur = %d, pos_max + 1 = %d)\n",
                                                 other.id, n_cur, (int) pos_max + 1);
                                         continue;
