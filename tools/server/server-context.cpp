@@ -3724,10 +3724,6 @@ private:
                                 SLT_DBG(slot, "prefix-share: scanning donors, n_past = %d, n_prefix_share = %d, task.n_tokens = %d\n",
                                         n_past, slot.task->params.n_prefix_share, slot.task->n_tokens());
 
-                                // media chunks cannot be aliased via seq_cp: the donor built its KV
-                                // from text, so the shared prefix must be pure text
-                                const size_t n_text = slot.task->tokens.get_text_tokens().size();
-
                                 for (auto & other : slots) {
                                     if (&other == &slot) {
                                         continue;
@@ -3775,14 +3771,6 @@ private:
                                         continue;
                                     }
 
-                                    // a media chunk inside the shared prefix would be skipped, but the
-                                    // donor's KV there comes from text - reject
-                                    if (n_text < (size_t) n_cur) {
-                                        SLT_DBG(slot, "prefix-share: reject slot %d (media chunk in shared prefix, n_text = %zu, n_cur = %d)\n",
-                                                other.id, n_text, n_cur);
-                                        continue;
-                                    }
-
                                     SLT_DBG(slot, "prefix-share: slot %d candidate (lcp = %d, donor.n_tokens = %d, pos_max = %d, n_cur = %d)\n",
                                             other.id, lcp, (int) other.prompt.n_tokens(), (int) pos_max, n_cur);
 
@@ -3802,19 +3790,14 @@ private:
 
                                     // drop this slot's own cells (its [0, n_past) KV is identical to the
                                     // donor's, so reusing the donor's cells frees the slot's duplicate VRAM)
-                                    if (!slot.prompt.tokens.empty()) {
-                                        slot.prompt.clear();
-                                    }
                                     slot.mem.seq_rm(slot.id, 0, -1);
 
                                     // alias the donor's whole prefix, then continue from the shared prefix
                                     slot.mem.seq_cp(donor->id, slot.id, 0, n_shared);
 
-                                    // get_text_tokens() is safe with mtmd enabled; get_tokens() asserts
-                                    // the task has no media at all
-                                    llama_tokens prefix = slot.task->tokens.get_text_tokens();
-                                    prefix.resize(n_shared);
-                                    slot.prompt.tokens.insert(prefix);
+                                    // media chunks in the shared prefix are kept as placeholders: the
+                                    // donor already encoded them, so they will never be encoded again
+                                    slot.prompt.tokens = slot.task->tokens.copy_prefix(n_shared);
 
                                     n_past = n_shared;
                                 } else {
