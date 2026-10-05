@@ -3712,6 +3712,7 @@ private:
                             // stays alive and each slot's SWA window slides independently
                             const bool ps_enabled = slot.task->params.n_prefix_share > 0;
                             const bool ps_gate = params_base.kv_unified && ps_enabled;
+                            bool did_prefix_share = false;
 
                             if (ps_enabled && !ps_gate) {
                                 // log why sharing was skipped so a verbose run can pinpoint the cause
@@ -3804,6 +3805,16 @@ private:
                                     // donor already encoded them, so they will never be encoded again
                                     slot.prompt.tokens = slot.task->tokens.copy_prefix(n_shared);
 
+                                    // drop the previous request's checkpoints: they were built from a
+                                    // different prompt than the one aliased above, so restoring one
+                                    // (now or on a later request) would load mismatched KV state
+                                    slot.prompt.checkpoints.clear();
+
+                                    // skip the checkpoint-restore path below for this request: the
+                                    // aliased cells are already live, and its do_reset branch would
+                                    // drop n_past back to 0 now that the list is empty
+                                    did_prefix_share = true;
+
                                     n_past = n_shared;
                                 } else {
                                     SLT_INF(slot, "prefix-share: no usable donor (best n_shared = %d, n_past = %d, threshold = %d)\n",
@@ -3819,7 +3830,9 @@ private:
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
 
-                            if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
+                            // skip checkpoint restore after a prefix-share: the aliased cells are
+                            // already live, and the stale checkpoints / do_reset path would undo it
+                            if (!did_prefix_share && n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
                                     SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
