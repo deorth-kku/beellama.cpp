@@ -3579,8 +3579,11 @@ private:
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
-                        slot.stats.update_prompt_start();
-
+                            // the prompt already started before a prefix-share wait, so do not
+                            // restart the timer when the wait resolves and re-enters STARTED
+                            if (!slot.wait_prefix_resolved) {
+                                slot.stats.update_prompt_start();
+                            }
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
@@ -3851,11 +3854,13 @@ private:
                                             continue;
                                         }
 
-                                        // at least one token must be evaluated by the new slot
-                                        const int lcp = (int) other.prompt.tokens.get_common_prefix(slot.task->tokens);
+                                        // n_full = lcp over the two full prompts (how far the donor can
+                                        // grow to share); n_cur stays capped by pos_max + 1, so the
+                                        // immediate-share path is unaffected by using full prompts here
+                                        const int lcp = (int) other.task->tokens.get_common_prefix(slot.task->tokens);
                                         const int n_full = std::min(
                                             lcp,
-                                            std::min((int) other.prompt.n_tokens(), slot.task->n_tokens() - 1));
+                                            std::min((int) other.task->n_tokens(), slot.task->n_tokens() - 1));
                                         const int n_cur = std::min(n_full, (int) pos_max + 1);
 
                                         SLT_DBG(slot, "prefix-share: slot %d candidate (lcp = %d, donor.n_tokens = %d, pos_max = %d, n_cur = %d, n_full = %d)\n",
