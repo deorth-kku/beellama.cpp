@@ -3754,7 +3754,6 @@ private:
                             // stays alive and each slot's SWA window slides independently
                             const bool ps_enabled = slot.task->params.n_prefix_share > 0;
                             const bool ps_gate = params_base.kv_unified && ps_enabled;
-                            bool did_prefix_share = false;
 
                             if (ps_enabled && !ps_gate) {
                                 // log why sharing was skipped so a verbose run can pinpoint the cause
@@ -3793,10 +3792,16 @@ private:
                                         slot.mem.seq_cp(d->id, slot.id, 0, avail);
                                         slot.prompt.tokens = slot.task->tokens.copy_prefix(avail);
 
-                                        // same as the immediate-share path: drop the stale checkpoints and
-                                        // skip the checkpoint-restore path below, which would undo the share
-                                        slot.prompt.checkpoints.clear();
-                                        did_prefix_share = true;
+                                        // inherit the donor's checkpoints that cover the shared prefix (same
+                                        // as the immediate-share path), so the checkpoint-restore path below
+                                        // can roll this slot back to a position behind the donor's tail
+                                        auto & dst_ckpt = slot.prompt.checkpoints;
+                                        dst_ckpt.clear();
+                                        for (auto & cur : d->prompt.checkpoints) {
+                                            if (cur.pos_max < avail) {
+                                                dst_ckpt.push_back(cur);
+                                            }
+                                        }
 
                                         n_past = avail;
                                     } else {
@@ -3853,15 +3858,6 @@ private:
                                             std::min((int) other.prompt.n_tokens(), slot.task->n_tokens() - 1));
                                         const int n_cur = std::min(n_full, (int) pos_max + 1);
 
-                                        // a recurrent model only holds its state at pos_max, so the shared
-                                        // prefix must reach exactly pos_max + 1; an attention-only model
-                                        // has KV at every position, so any prefix length works
-                                        if (has_recurrent && n_cur != pos_max + 1) {
-                                            SLT_DBG(slot, "prefix-share: reject slot %d (n_cur = %d, pos_max + 1 = %d)\n",
-                                                    other.id, n_cur, (int) pos_max + 1);
-                                            continue;
-                                        }
-
                                         SLT_DBG(slot, "prefix-share: slot %d candidate (lcp = %d, donor.n_tokens = %d, pos_max = %d, n_cur = %d, n_full = %d)\n",
                                                 other.id, lcp, (int) other.prompt.n_tokens(), (int) pos_max, n_cur, n_full);
 
@@ -3911,15 +3907,19 @@ private:
                                         // donor already encoded them, so they will never be encoded again
                                         slot.prompt.tokens = slot.task->tokens.copy_prefix(n_shared);
 
-                                        // drop the previous request's checkpoints: they were built from a
-                                        // different prompt than the one aliased above, so restoring one
-                                        // (now or on a later request) would load mismatched KV state
-                                        slot.prompt.checkpoints.clear();
-
-                                        // skip the checkpoint-restore path below for this request: the
-                                        // aliased cells are already live, and its do_reset branch would
-                                        // drop n_past back to 0 now that the list is empty
-                                        did_prefix_share = true;
+                                        // inherit the donor's checkpoints that cover the shared prefix: they
+                                        // were built from the same prompt, so the checkpoint-restore path below
+                                        // can roll this slot back to a position behind the donor's tail (the
+                                        // recurrent state lives only at the tail). this mirrors how a serial
+                                        // request in the same slot would roll back. the donor's own list is
+                                        // left untouched
+                                        auto & dst_ckpt = slot.prompt.checkpoints;
+                                        dst_ckpt.clear();
+                                        for (auto & cur : donor->prompt.checkpoints) {
+                                            if (cur.pos_max < n_shared) {
+                                                dst_ckpt.push_back(cur);
+                                            }
+                                        }
 
                                         n_past = n_shared;
                                     } else {
@@ -3937,9 +3937,10 @@ private:
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
 
-                            // skip checkpoint restore after a prefix-share: the aliased cells are
-                            // already live, and the stale checkpoints / do_reset path would undo it
-                            if (!did_prefix_share && n_past > 0 && n_past <= slot.prompt.n_tokens()) {
+                            // restore a context checkpoint to roll this slot back to n_past. after a
+                            // prefix-share the inherited donor checkpoints make this a rollback to a
+                            // position behind the donor's tail (recurrent state lives only at the tail)
+                            if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
                                     SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
