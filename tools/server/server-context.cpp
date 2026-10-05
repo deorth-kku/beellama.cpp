@@ -3818,9 +3818,11 @@ private:
                                     // best donor to wait for: the largest full share among donors still prefilling
                                     int n_wait_target = 0;
                                     server_slot * donor_wait = nullptr;
-                                    const bool ps_wait = params_base.n_prefix_share_wait > 0;
+                                    // 0 disables the wait; a negative value means "wait forever"
+                                    const bool ps_wait = params_base.n_prefix_share_wait != 0;
 
-                                    SLT_DBG(slot, "prefix-share: scanning donors, n_past = %d, n_prefix_share = %d, task.n_tokens = %d\n",
+                                    SLT_DBG(slot, "prefix-share: scanning donors, n_past = %d, n_prefix_share = %d, task.n_tokens = %d\
+",
                                             n_past, slot.task->params.n_prefix_share, slot.task->n_tokens());
 
                                     for (auto & other : slots) {
@@ -3888,7 +3890,10 @@ private:
                                                 donor_wait->id, n_wait_target, (int) donor_wait->mem.seq_pos_max(donor_wait->id) + 1, n_past);
                                         slot.wait_prefix_donor    = donor_wait->id;
                                         slot.wait_prefix_target   = n_wait_target;
-                                        slot.wait_prefix_deadline = ggml_time_us() + (int64_t) params_base.n_prefix_share_wait * 1000;
+                                        // a negative wait means "wait forever" (no deadline)
+                                        slot.wait_prefix_deadline = (params_base.n_prefix_share_wait < 0)
+                                            ? INT64_MAX
+                                            : ggml_time_us() + (int64_t) params_base.n_prefix_share_wait * 1000;
                                         slot.state = SLOT_STATE_WAIT_PREFIX;
                                         return;
                                     }

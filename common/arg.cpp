@@ -3618,7 +3618,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--prefix-share-wait"}, "MS",
         string_format(
             "max time in ms to wait for a donor slot to finish prefilling the shared prefix before aliasing it, "
-            "requires --prefix-share (default: %d)",
+            "a negative value waits indefinitely, requires --prefix-share (default: %d)",
             params.n_prefix_share_wait
         ),
         [](common_params & params, int value) {
