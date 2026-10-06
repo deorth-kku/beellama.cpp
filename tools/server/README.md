@@ -221,6 +221,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--threads-http N` | number of threads used to process HTTP requests (default: -1)<br/>(env: LLAMA_ARG_THREADS_HTTP) |
 | `--cache-prompt, --no-cache-prompt` | whether to enable prompt caching (default: enabled)<br/>(env: LLAMA_ARG_CACHE_PROMPT) |
 | `--cache-reuse N` | min chunk size to attempt reusing from the cache via KV shifting, requires prompt caching to be enabled (default: 0)<br/>[(card)](https://ggml.ai/f0.png)<br/>(env: LLAMA_ARG_CACHE_REUSE) |
+| `--prefix-share N` | min shared prompt prefix length to alias KV cells from another slot, requires `--kv-unified` (default: 0) |
 | `--metrics` | enable prometheus compatible metrics endpoint (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_METRICS) |
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
@@ -533,6 +534,8 @@ By default, this value is set to `0`, meaning no tokens are kept. Use `-1` to re
 `n_cmpl`: Number of completions to generate from the current prompt. If input has multiple prompts, the output will have N prompts times `n_cmpl` entries.
 
 `n_cache_reuse`: Min chunk size to attempt reusing from the cache via KV shifting. For more info, see `--cache-reuse` arg. Default: `0`, which is disabled.
+
+`n_prefix_share`: Min shared prompt prefix length to alias KV cells from another slot. For more info, see `--prefix-share` arg. Default: `0`, which is disabled.
 
 `stream`: Allows receiving each predicted token in real-time instead of waiting for the completion to finish (uses a different response format). To enable this, set to `true`.
 

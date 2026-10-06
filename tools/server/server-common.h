@@ -254,6 +254,10 @@ public:
     bool validate(const struct llama_context * ctx) const;
 
     server_tokens clone() const;
+
+    // copies the first n tokens; media chunks are stored as placeholders.
+    // only use this if the chunks are already in the KV cache and will never be encoded again
+    server_tokens copy_prefix(size_t n) const;
 };
 
 

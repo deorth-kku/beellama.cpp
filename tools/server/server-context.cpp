@@ -131,6 +131,7 @@ enum slot_state {
     SLOT_STATE_PROCESSING_PROMPT,
     SLOT_STATE_DONE_PROMPT,
     SLOT_STATE_GENERATING,
+    SLOT_STATE_WAIT_PREFIX, // waiting for a donor slot to prefill the shared prefix before aliasing it
 };
 
 struct server_slot; // forward declaration
@@ -304,6 +305,13 @@ struct server_slot {
     // state
     slot_state state = SLOT_STATE_IDLE;
 
+    // prefix-share waiting: donor to alias from, target share length, deadline (us), and a flag
+    // set when the wait resolves so the re-entered STARTED pass aliases immediately instead of re-waiting
+    int     wait_prefix_donor    = -1;
+    int     wait_prefix_target   = 0;
+    int64_t wait_prefix_deadline = 0;
+    bool    wait_prefix_resolved = false;
+
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
@@ -388,6 +396,11 @@ struct server_slot {
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
+
+        wait_prefix_donor    = -1;
+        wait_prefix_target   = 0;
+        wait_prefix_deadline = 0;
+        wait_prefix_resolved = false;
 
         if (can_speculate()) {
             spec_draft.clear();
@@ -1449,6 +1462,11 @@ private:
                 params_base.n_cache_reuse = 0;
                 SRV_WRN("%s\n", "cache_reuse is not supported by this context, it will be disabled");
             }
+        }
+
+        if (params_base.n_prefix_share > 0 && !params_base.kv_unified) {
+            params_base.n_prefix_share = 0;
+            SRV_WRN("%s\n", "prefix_share is not supported without --kv-unified, it will be disabled");
         }
 
         if (llama_model_n_swa(model_tgt) == 0) {
@@ -3405,6 +3423,13 @@ private:
                     return;
                 }
 
+                // shifting would move the KV cells in place, corrupting the other owner
+                if (slot.mem.seq_is_shared(slot.id)) {
+                    send_error(slot, "context shift cannot be used for shared prompt", ERROR_TYPE_SERVER);
+                    slot.release();
+                    return;
+                }
+
                 // Shift context
                 int n_keep = slot.task->params.n_keep < 0 ? slot.task->n_tokens() : slot.task->params.n_keep;
 
@@ -3613,6 +3638,35 @@ private:
                     return;
                 }
 
+                // waiting for a donor slot to prefill the shared prefix before aliasing it
+                if (slot.state == SLOT_STATE_WAIT_PREFIX) {
+                    server_slot * d = nullptr;
+                    for (auto & s : slots) {
+                        if (s.id == slot.wait_prefix_donor) {
+                            d = &s;
+                            break;
+                        }
+                    }
+                    const int  pos_max     = d ? (int) d->mem.seq_pos_max(d->id) : -1;
+                    const bool donor_alive = d && pos_max >= 0;
+                    const bool reached     = donor_alive && pos_max + 1 >= slot.wait_prefix_target;
+                    const bool cancelled   = d && d->state == SLOT_STATE_IDLE;
+                    const bool timed_out   = ggml_time_us() >= slot.wait_prefix_deadline;
+
+                    if (reached || cancelled || timed_out || !donor_alive) {
+                        // stop waiting: re-enter STARTED and alias what the donor has (or fall back to
+                        // an independent prefill if its cells were evicted)
+                        SLT_INF(slot, "prefix-share wait resolved (donor = %d, pos_max = %d, target = %d, reached = %d, cancelled = %d, timed_out = %d)\n",
+                                slot.wait_prefix_donor, pos_max, slot.wait_prefix_target, (int) reached, (int) cancelled, (int) timed_out);
+                        slot.wait_prefix_resolved = true;
+                        slot.state = SLOT_STATE_STARTED;
+                    } else {
+                        SLT_DBG(slot, "prefix-share: still waiting for slot %d (pos_max = %d, target = %d)\n",
+                                slot.wait_prefix_donor, pos_max, slot.wait_prefix_target);
+                        return;
+                    }
+                }
+
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
                     const auto & input_tokens = slot.task->tokens;
@@ -3622,8 +3676,11 @@ private:
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
-                        slot.stats.update_prompt_start();
-
+                            // the prompt already started before a prefix-share wait, so do not
+                            // restart the timer when the wait resolves and re-enters STARTED
+                            if (!slot.wait_prefix_resolved) {
+                                slot.stats.update_prompt_start();
+                            }
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
@@ -3727,9 +3784,11 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
+                                // shifting KV cells in place would corrupt the other owner of a shared cell
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    !slot.prompt.tokens.has_mtmd &&
+                                    !slot.mem.seq_is_shared(slot.id);
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
@@ -3789,6 +3848,191 @@ private:
                                 n_past = 0;
                             }
 
+                            // share the prompt prefix with another live slot: alias its KV cells
+                            // instead of re-prefilling them, only possible with a unified cache.
+                            // SWA is fine: old cells are masked, not freed, so the donor's prefix
+                            // stays alive and each slot's SWA window slides independently
+                            const bool ps_enabled = slot.task->params.n_prefix_share > 0;
+                            const bool ps_gate = params_base.kv_unified && ps_enabled;
+
+                            if (ps_enabled && !ps_gate) {
+                                // log why sharing was skipped so a verbose run can pinpoint the cause
+                                SLT_INF(slot, "prefix-share skipped: kv_unified = %d, n_prefix_share = %d\n",
+                                        (int) params_base.kv_unified, slot.task->params.n_prefix_share);
+                            }
+
+                            if (ps_gate) {
+                                if (slot.wait_prefix_resolved) {
+                                    // we already waited for a donor; alias what it has now (or fall back)
+                                    slot.wait_prefix_resolved = false;
+                                    const int donor_id = slot.wait_prefix_donor;
+                                    const int target   = slot.wait_prefix_target;
+                                    slot.wait_prefix_donor  = -1;
+                                    slot.wait_prefix_target = 0;
+
+                                    server_slot * d = nullptr;
+                                    for (auto & s : slots) {
+                                        if (s.id == donor_id) {
+                                            d = &s;
+                                            break;
+                                        }
+                                    }
+                                    const int pos_max = d ? (int) d->mem.seq_pos_max(d->id) : -1;
+                                    const int avail = pos_max >= 0 ?
+                                        std::min(target, std::min(pos_max + 1, slot.task->n_tokens() - 1)) : 0;
+
+                                    if (avail >= slot.task->params.n_prefix_share && avail > n_past) {
+                                        SLT_INF(slot, "sharing prompt prefix with slot %d after wait (n_shared = %d, own n_past = %d)\n",
+                                                donor_id, avail, n_past);
+
+                                        slot.mem.seq_rm(slot.id, 0, -1);
+                                        slot.mem.seq_cp(d->id, slot.id, 0, avail);
+                                        slot.prompt.tokens = slot.task->tokens.copy_prefix(avail);
+
+                                        // inherit the donor's checkpoints that cover the shared prefix (same
+                                        // as the immediate-share path), so the checkpoint-restore path below
+                                        // can roll this slot back to a position behind the donor's tail
+                                        auto & dst_ckpt = slot.prompt.checkpoints;
+                                        dst_ckpt.clear();
+                                        for (auto & cur : d->prompt.checkpoints) {
+                                            if (cur.pos_max < avail) {
+                                                dst_ckpt.push_back(cur);
+                                            }
+                                        }
+
+                                        n_past = avail;
+                                    } else {
+                                        SLT_INF(slot, "prefix-share: no usable donor after wait (avail = %d, n_past = %d) - prefilling independently\n",
+                                                avail, n_past);
+                                    }
+                                } else {
+                                    int n_shared = 0;
+                                    server_slot * donor = nullptr;
+
+                                    // best donor to wait for: the largest full share among donors still prefilling
+                                    int n_wait_target = 0;
+                                    server_slot * donor_wait = nullptr;
+                                    // 0 disables the wait; a negative value means "wait forever"
+                                    const bool ps_wait = params_base.n_prefix_share_wait != 0;
+
+                                    SLT_DBG(slot, "prefix-share: scanning donors, n_past = %d, n_prefix_share = %d, task.n_tokens = %d\
+",
+                                            n_past, slot.task->params.n_prefix_share, slot.task->n_tokens());
+
+                                    for (auto & other : slots) {
+                                        if (&other == &slot) {
+                                            continue;
+                                        }
+
+                                        const bool state_ok =
+                                            other.state == SLOT_STATE_PROCESSING_PROMPT ||
+                                            other.state == SLOT_STATE_DONE_PROMPT ||
+                                            other.state == SLOT_STATE_GENERATING;
+                                        if (!state_ok) {
+                                            continue;
+                                        }
+
+                                        if (!other.task || other.truncated ||
+                                            other.task->is_parent() || other.task->is_child()) {
+                                            SLT_DBG(slot, "prefix-share: reject slot %d (no task / truncated / parent / child)\n",
+                                                    other.id);
+                                            continue;
+                                        }
+
+                                        // the donor prefix must be live: it has processed at least one token, and
+                                        // (non-SWA) the attention cache is contiguous [0, pos_max]. we do NOT require
+                                        // pos_min == 0, because a hybrid (recurrent) model reports pos_min == pos_max
+                                        // (the recurrent state only exists at the latest position)
+                                        const auto pos_max = other.mem.seq_pos_max(other.id);
+                                        if (pos_max < 0) {
+                                            SLT_DBG(slot, "prefix-share: reject slot %d (pos_max = %d)\n",
+                                                    other.id, (int) pos_max);
+                                            continue;
+                                        }
+
+                                        // n_full = lcp over the two full prompts (how far the donor can
+                                        // grow to share); n_cur stays capped by pos_max + 1, so the
+                                        // immediate-share path is unaffected by using full prompts here
+                                        const int lcp = (int) other.task->tokens.get_common_prefix(slot.task->tokens);
+                                        const int n_full = std::min(
+                                            lcp,
+                                            std::min((int) other.task->n_tokens(), slot.task->n_tokens() - 1));
+                                        const int n_cur = std::min(n_full, (int) pos_max + 1);
+
+                                        SLT_DBG(slot, "prefix-share: slot %d candidate (lcp = %d, donor.n_tokens = %d, pos_max = %d, n_cur = %d, n_full = %d)\n",
+                                                other.id, lcp, (int) other.prompt.n_tokens(), (int) pos_max, n_cur, n_full);
+
+                                        if (n_cur > n_shared) {
+                                            n_shared = n_cur;
+                                            donor = &other;
+                                        }
+
+                                        // a donor still prefilling can grow to n_full; remember the best one to wait for
+                                        if (ps_wait && other.state == SLOT_STATE_PROCESSING_PROMPT &&
+                                            n_full > n_cur && n_full > n_wait_target) {
+                                            n_wait_target = n_full;
+                                            donor_wait = &other;
+                                        }
+                                    }
+
+                                    // wait for a donor to finish prefilling the shared prefix before aliasing it
+                                    const bool do_wait = ps_wait && donor_wait &&
+                                        n_wait_target >= slot.task->params.n_prefix_share && n_wait_target > n_past;
+
+                                    if (do_wait) {
+                                        SLT_INF(slot, "waiting for slot %d to prefill shared prefix (target = %d, current = %d, own n_past = %d)\n",
+                                                donor_wait->id, n_wait_target, (int) donor_wait->mem.seq_pos_max(donor_wait->id) + 1, n_past);
+                                        slot.wait_prefix_donor    = donor_wait->id;
+                                        slot.wait_prefix_target   = n_wait_target;
+                                        // a negative wait means "wait forever" (no deadline)
+                                        slot.wait_prefix_deadline = (params_base.n_prefix_share_wait < 0)
+                                            ? INT64_MAX
+                                            : ggml_time_us() + (int64_t) params_base.n_prefix_share_wait * 1000;
+                                        slot.state = SLOT_STATE_WAIT_PREFIX;
+                                        return;
+                                    }
+
+                                    // share only when the donor offers more than this slot already cached
+                                    const bool do_share = donor &&
+                                        n_shared >= slot.task->params.n_prefix_share && n_shared > n_past;
+
+                                    if (do_share) {
+                                        SLT_INF(slot, "sharing prompt prefix with slot %d (n_shared = %d, own n_past = %d)\n",
+                                                donor->id, n_shared, n_past);
+
+                                        // drop this slot's own cells (its [0, n_past) KV is identical to the
+                                        // donor's, so reusing the donor's cells frees the slot's duplicate VRAM)
+                                        slot.mem.seq_rm(slot.id, 0, -1);
+
+                                        // alias the donor's whole prefix, then continue from the shared prefix
+                                        slot.mem.seq_cp(donor->id, slot.id, 0, n_shared);
+
+                                        // media chunks in the shared prefix are kept as placeholders: the
+                                        // donor already encoded them, so they will never be encoded again
+                                        slot.prompt.tokens = slot.task->tokens.copy_prefix(n_shared);
+
+                                        // inherit the donor's checkpoints that cover the shared prefix: they
+                                        // were built from the same prompt, so the checkpoint-restore path below
+                                        // can roll this slot back to a position behind the donor's tail (the
+                                        // recurrent state lives only at the tail). this mirrors how a serial
+                                        // request in the same slot would roll back. the donor's own list is
+                                        // left untouched
+                                        auto & dst_ckpt = slot.prompt.checkpoints;
+                                        dst_ckpt.clear();
+                                        for (auto & cur : donor->prompt.checkpoints) {
+                                            if (cur.pos_max < n_shared) {
+                                                dst_ckpt.push_back(cur);
+                                            }
+                                        }
+
+                                        n_past = n_shared;
+                                    } else {
+                                        SLT_INF(slot, "prefix-share: no usable donor (best n_shared = %d, n_past = %d, threshold = %d)\n",
+                                                n_shared, n_past, slot.task->params.n_prefix_share);
+                                    }
+                                }
+                            }
+
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
@@ -3797,6 +4041,9 @@ private:
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
 
+                            // restore a context checkpoint to roll this slot back to n_past. after a
+                            // prefix-share the inherited donor checkpoints make this a rollback to a
+                            // position behind the donor's tail (recurrent state lives only at the tail)
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
