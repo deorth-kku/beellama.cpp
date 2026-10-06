@@ -180,6 +180,10 @@ void llama_grammar_apply_impl(
         const struct llama_grammar & grammar,
             llama_token_data_array * cur_p);
 
+// compute the set of token ids allowed by the current grammar state
+// returns an empty set when there is no active constraint (awaiting trigger)
+std::vector<llama_token> llama_grammar_get_valid_tokens(const struct llama_grammar & grammar);
+
 void llama_grammar_accept_impl(
               struct llama_grammar & grammar,
                        llama_token   token);

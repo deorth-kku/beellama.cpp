@@ -117,6 +117,9 @@ struct common_sampler {
     struct llama_sampler * rbudget;
     struct llama_sampler * chain;
 
+    // composing wrapper that exposes chain + grammar as a single backend sampler
+    struct llama_sampler * backend;
+
     ring_buffer<llama_token> prev;
 
     std::vector<llama_token_data> cur;
@@ -412,6 +415,136 @@ static struct llama_sampler * common_sampler_logit_bias_phase_init(
     return common_sampler_logit_bias_phase_from_ctx(ctx);
 }
 
+// composing wrapper: exposes the common_sampler's chain + grammar as a single
+// backend sampler. the grammar mask is applied before the chain so invalid
+// tokens are masked out before temperature/top_k/etc. run on the backend.
+// the ctx is the common_sampler itself (owned elsewhere, not deleted here).
+
+static const char * common_sampler_backend_name(const struct llama_sampler * smpl) {
+    GGML_UNUSED(smpl);
+    return "common-sampler";
+}
+
+static void common_sampler_backend_accept(struct llama_sampler * smpl, llama_token token) {
+    auto * gsmpl = (common_sampler *) smpl->ctx;
+    llama_sampler_accept(gsmpl->grmr, token);
+    llama_sampler_accept(gsmpl->chain, token);
+}
+
+static void common_sampler_backend_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    // not used: the CPU path applies grmr/chain directly, not through this wrapper
+    GGML_UNUSED(smpl);
+    GGML_UNUSED(cur_p);
+}
+
+static void common_sampler_backend_reset(struct llama_sampler * smpl) {
+    auto * gsmpl = (common_sampler *) smpl->ctx;
+    llama_sampler_reset(gsmpl->grmr);
+    llama_sampler_reset(gsmpl->chain);
+}
+
+static struct llama_sampler * common_sampler_backend_clone(const struct llama_sampler * smpl) {
+    GGML_UNUSED(smpl);
+    return nullptr;
+}
+
+static void common_sampler_backend_free(struct llama_sampler * smpl) {
+    // the ctx is the common_sampler, which owns grmr/chain; do not delete it here
+    GGML_UNUSED(smpl);
+}
+
+static bool common_sampler_backend_init(
+        struct llama_sampler       * smpl,
+        ggml_backend_buffer_type_t   buft,
+        uint32_t                     n_outputs_max_per_seq) {
+    auto * gsmpl = (common_sampler *) smpl->ctx;
+
+    // the grammar must support the requested output limit (non-speculative)
+    bool grmr_ok = true;
+    if (gsmpl->grmr) {
+        grmr_ok = gsmpl->grmr->iface->backend_init(gsmpl->grmr, buft, n_outputs_max_per_seq);
+    }
+
+    bool chain_ok = gsmpl->chain->iface->backend_init(gsmpl->chain, buft, n_outputs_max_per_seq);
+    if (!grmr_ok || !chain_ok) {
+        return false;
+    }
+
+    // chain node count plus a small fixed contribution from the grammar mask
+    smpl->n_nodes = llama_sampler_backend_n_nodes(gsmpl->chain) + 8;
+
+    return true;
+}
+
+static void common_sampler_backend_baccept(
+        struct llama_sampler * smpl,
+        struct ggml_context  * ctx,
+        struct ggml_cgraph   * gf,
+        struct ggml_tensor   * selected_token) {
+    auto * gsmpl = (common_sampler *) smpl->ctx;
+
+    if (gsmpl->grmr && gsmpl->grmr->iface->backend_accept) {
+        gsmpl->grmr->iface->backend_accept(gsmpl->grmr, ctx, gf, selected_token);
+    }
+    gsmpl->chain->iface->backend_accept(gsmpl->chain, ctx, gf, selected_token);
+}
+
+static void common_sampler_backend_bapply(
+        struct llama_sampler      * smpl,
+        struct ggml_context       * ctx,
+        struct ggml_cgraph        * gf,
+        struct llama_sampler_data * data) {
+    auto * gsmpl = (common_sampler *) smpl->ctx;
+
+    // grammar mask first, then the chain
+    if (gsmpl->grmr && gsmpl->grmr->iface->backend_apply) {
+        gsmpl->grmr->iface->backend_apply(gsmpl->grmr, ctx, gf, data);
+    }
+    gsmpl->chain->iface->backend_apply(gsmpl->chain, ctx, gf, data);
+}
+
+static void common_sampler_backend_bset_input(struct llama_sampler * smpl) {
+    auto * gsmpl = (common_sampler *) smpl->ctx;
+
+    if (gsmpl->grmr && gsmpl->grmr->iface->backend_set_input) {
+        gsmpl->grmr->iface->backend_set_input(gsmpl->grmr);
+    }
+    gsmpl->chain->iface->backend_set_input(gsmpl->chain);
+}
+
+static void common_sampler_backend_breset(struct llama_sampler * smpl) {
+    auto * gsmpl = (common_sampler *) smpl->ctx;
+
+    if (gsmpl->grmr && gsmpl->grmr->iface->backend_reset) {
+        gsmpl->grmr->iface->backend_reset(gsmpl->grmr);
+    }
+    gsmpl->chain->iface->backend_reset(gsmpl->chain);
+}
+
+static void common_sampler_backend_copy_state(const struct llama_sampler * src, struct llama_sampler * dst) {
+    auto * src_gsmpl = (common_sampler *) src->ctx;
+    auto * dst_gsmpl = (common_sampler *) dst->ctx;
+    if (src_gsmpl->grmr) {
+        llama_sampler_copy(src_gsmpl->grmr, dst_gsmpl->grmr);
+    }
+    llama_sampler_copy(src_gsmpl->chain, dst_gsmpl->chain);
+}
+
+static struct llama_sampler_i common_sampler_backend_i = {
+    /* .name              = */ common_sampler_backend_name,
+    /* .accept            = */ common_sampler_backend_accept,
+    /* .apply             = */ common_sampler_backend_apply,
+    /* .reset             = */ common_sampler_backend_reset,
+    /* .clone             = */ common_sampler_backend_clone,
+    /* .free              = */ common_sampler_backend_free,
+    /* .backend_init      = */ common_sampler_backend_init,
+    /* .backend_accept    = */ common_sampler_backend_baccept,
+    /* .backend_apply     = */ common_sampler_backend_bapply,
+    /* .backend_set_input = */ common_sampler_backend_bset_input,
+    /* .backend_reset     = */ common_sampler_backend_breset,
+    /* .copy_state        = */ common_sampler_backend_copy_state,
+};
+
 struct common_sampler * common_sampler_init(
         const struct llama_model * model,
         struct common_params_sampling & params) {
@@ -659,23 +792,20 @@ struct common_sampler * common_sampler_init(
         llama_sampler_chain_add(chain, smpl);
     }
 
-    if (grmr && params.backend_sampling) {
-        LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
-
-        params.backend_sampling = false;
-    }
-
     auto * result = new common_sampler {
         /* .params  = */ params,
         /* .grmr    = */ grmr,
         /* .rbudget = */ rbudget,
         /* .chain   = */ chain,
+        /* .backend = */ nullptr,
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
+
+    result->backend = llama_sampler_init(&common_sampler_backend_i, result);
 
     return result;
 }
@@ -685,6 +815,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
         return;
     }
 
+    llama_sampler_free(gsmpl->backend);
     llama_sampler_free(gsmpl->grmr);
     llama_sampler_free(gsmpl->rbudget);
     llama_sampler_free(gsmpl->chain);
@@ -750,16 +881,19 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    auto * result = new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
+        /* .backend = */ nullptr,
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
     };
+    result->backend = llama_sampler_init(&common_sampler_backend_i, result);
+    return result;
 }
 
 void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
@@ -833,7 +967,7 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
         return nullptr;
     }
 
-    return gsmpl->chain;
+    return gsmpl->backend;
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
@@ -858,8 +992,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
         if (id != LLAMA_TOKEN_NULL) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
-
-            GGML_ASSERT(!gsmpl->grmr && "using grammar in combination with backend sampling is not supported");
 
             if (gsmpl->rbudget && common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING) {
                 const llama_token forced = common_reasoning_budget_get_forced_token(gsmpl->rbudget);

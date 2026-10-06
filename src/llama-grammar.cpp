@@ -1399,6 +1399,63 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
     }
 }
 
+std::vector<llama_token> llama_grammar_get_valid_tokens(const struct llama_grammar & grammar) {
+    GGML_ASSERT(grammar.vocab != nullptr);
+
+    std::vector<llama_token> valid;
+
+    if (grammar.awaiting_trigger) {
+        // lazy grammar not triggered: no constraint
+        return valid;
+    }
+
+    bool allow_eog = false;
+    for (const auto & stack : grammar.stacks) {
+        if (stack.empty()) {
+            allow_eog = true;
+            break;
+        }
+    }
+
+    const int n_vocab = llama_vocab_n_tokens(grammar.vocab);
+
+    std::vector<std::pair<std::vector<uint32_t>, llama_partial_utf8>> candidates_decoded;
+    candidates_decoded.reserve(n_vocab);
+
+    llama_grammar_candidates candidates_grammar;
+    candidates_grammar.reserve(n_vocab);
+
+    for (int32_t id = 0; id < n_vocab; ++id) {
+        const std::string & piece = grammar.vocab->token_to_piece(id);
+
+        if (grammar.vocab->is_eog(id)) {
+            if (allow_eog) {
+                valid.push_back(id);
+            }
+        } else if (piece.empty() || piece[0] == 0) {
+            continue;
+        } else {
+            candidates_decoded.push_back(decode_utf8(piece, grammar.partial_utf8));
+            candidates_grammar.push_back({ candidates_grammar.size(), candidates_decoded.back().first.data(), candidates_decoded.back().second, id });
+        }
+    }
+
+    const auto rejects = llama_grammar_reject_candidates(grammar.rules, grammar.stacks, candidates_grammar);
+
+    std::vector<bool> rejected(n_vocab, false);
+    for (const auto & reject : rejects) {
+        rejected[candidates_grammar[reject.index].id] = true;
+    }
+
+    for (const auto & cand : candidates_grammar) {
+        if (!rejected[cand.id]) {
+            valid.push_back(cand.id);
+        }
+    }
+
+    return valid;
+}
+
 void llama_grammar_accept_impl(struct llama_grammar & grammar, llama_token token) {
     GGML_ASSERT(grammar.vocab != nullptr);
 

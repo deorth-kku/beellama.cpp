@@ -766,6 +766,7 @@ static bool llama_sampler_chain_backend_init(
 
     auto probe = llama_sampler_backend_probe_graph(smpl, 128*1024, GGML_DEFAULT_GRAPH_SIZE, false);
     chain->n_nodes = llama_sampler_backend_probe_n_nodes(probe);
+    smpl->n_nodes = chain->n_nodes;
 
     return res;
 }
@@ -884,12 +885,9 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler) {
     GGML_ASSERT(sampler != nullptr);
-    GGML_ASSERT(sampler->iface == &llama_sampler_chain_i);
+    GGML_ASSERT(sampler->n_nodes > 0);
 
-    const auto * chain = (const llama_sampler_chain *) sampler->ctx;
-    GGML_ASSERT(chain->is_init);
-
-    return chain->n_nodes;
+    return sampler->n_nodes;
 }
 
 llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) {
@@ -2664,6 +2662,10 @@ struct llama_sampler_grammar {
     std::string grammar_root;
 
     struct llama_grammar * grammar;
+
+    // backend sampling
+    int32_t n_vocab = 0;
+    struct ggml_tensor * inp_mask = nullptr;
 };
 
 static const char * llama_sampler_grammar_name(const struct llama_sampler * /*smpl*/) {
@@ -2682,6 +2684,68 @@ static void llama_sampler_grammar_apply(struct llama_sampler * smpl, llama_token
     if (ctx->grammar) {
         llama_grammar_apply_impl(*ctx->grammar, cur_p);
     }
+}
+
+static bool llama_sampler_grammar_backend_init(
+        struct llama_sampler       * smpl,
+        ggml_backend_buffer_type_t   buft,
+        uint32_t                     n_outputs_max_per_seq) {
+    GGML_UNUSED(buft);
+
+    // grammar masking is per-token, only supported for the single-output (non-speculative) case
+    if (n_outputs_max_per_seq > 1) {
+        return false;
+    }
+
+    auto * ctx = (llama_sampler_grammar *) smpl->ctx;
+    return ctx->grammar != nullptr;
+}
+
+static void llama_sampler_grammar_backend_apply(
+        struct llama_sampler      * smpl,
+        struct ggml_context       * ctx,
+        struct ggml_cgraph        * gf,
+        struct llama_sampler_data * data) {
+    GGML_UNUSED(gf);
+
+    auto * sctx = (llama_sampler_grammar *) smpl->ctx;
+    if (!sctx->grammar) {
+        return;
+    }
+
+    if (sctx->inp_mask == nullptr) {
+        sctx->inp_mask = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, sctx->n_vocab);
+        ggml_set_name(sctx->inp_mask, "grammar_mask");
+        ggml_set_input(sctx->inp_mask);
+    }
+
+    data->logits = ggml_add(ctx, data->logits, sctx->inp_mask);
+}
+
+static void llama_sampler_grammar_backend_set_input(struct llama_sampler * smpl) {
+    auto * ctx = (llama_sampler_grammar *) smpl->ctx;
+    if (!ctx->inp_mask) {
+        return;
+    }
+
+    // default: no constraint (all tokens allowed)
+    std::vector<float> mask(ctx->n_vocab, 0.0f);
+
+    if (ctx->grammar && !ctx->grammar->awaiting_trigger) {
+        // constrained: invalid tokens -> -inf
+        std::fill(mask.begin(), mask.end(), -INFINITY);
+        const auto valid = llama_grammar_get_valid_tokens(*ctx->grammar);
+        for (llama_token id : valid) {
+            mask[id] = 0.0f;
+        }
+    }
+
+    ggml_backend_tensor_set(ctx->inp_mask, mask.data(), 0, ggml_nbytes(ctx->inp_mask));
+}
+
+static void llama_sampler_grammar_backend_reset(struct llama_sampler * smpl) {
+    auto * ctx = (llama_sampler_grammar *) smpl->ctx;
+    ctx->inp_mask = nullptr;
 }
 
 // Fwd declare to break reset --> init_impl --> llama_sampler_grammar_i --> reset cycle.
@@ -2755,11 +2819,11 @@ static struct llama_sampler_i llama_sampler_grammar_i = {
     /* .reset             = */ llama_sampler_grammar_reset,
     /* .clone             = */ llama_sampler_grammar_clone,
     /* .free              = */ llama_sampler_grammar_free,
-    /* .backend_init      = */ nullptr,
+    /* .backend_init      = */ llama_sampler_grammar_backend_init,
     /* .backend_accept    = */ nullptr,
-    /* .backend_apply     = */ nullptr,
-    /* .backend_set_input = */ nullptr,
-    /* .backend_reset     = */ nullptr,
+    /* .backend_apply     = */ llama_sampler_grammar_backend_apply,
+    /* .backend_set_input = */ llama_sampler_grammar_backend_set_input,
+    /* .backend_reset     = */ llama_sampler_grammar_backend_reset,
     /* .copy_state        = */ nullptr,
 };
 
@@ -2802,6 +2866,8 @@ static struct llama_sampler * llama_sampler_init_grammar_impl(
             /* .grammar_str  = */ grammar_str,
             /* .grammar_root = */ grammar_root,
             /* .grammar      = */ grammar,
+            /* .n_vocab      = */ vocab ? llama_vocab_n_tokens(vocab) : 0,
+            /* .inp_mask     = */ nullptr,
         };
         if (!ctx->grammar) {
             delete ctx;

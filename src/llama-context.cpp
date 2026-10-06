@@ -267,14 +267,18 @@ llama_context::llama_context(
         for (size_t i = 0; i < params.n_samplers; ++i) {
             const auto & config = params.samplers[i];
 
-            if (llama_sampler_chain_get(config.sampler, -1) == nullptr) {
-                throw std::runtime_error("the backend samplers must be of type llama_sampler_chain");
+            if (config.sampler->iface->backend_init == nullptr) {
+                throw std::runtime_error("the backend samplers must support backend sampling");
             }
 
             if (set_sampler(config.seq_id, config.sampler)) {
-                const int n_samplers = llama_sampler_chain_n(config.sampler);
-
-                LLAMA_LOG_INFO("%s: setting backend sampler for seq_id %d (n = %d)\n", __func__, config.seq_id, n_samplers);
+                const auto * chain = llama_sampler_chain_get(config.sampler, -1);
+                if (chain != nullptr) {
+                    const int n_samplers = llama_sampler_chain_n(config.sampler);
+                    LLAMA_LOG_INFO("%s: setting backend sampler for seq_id %d (n = %d)\n", __func__, config.seq_id, n_samplers);
+                } else {
+                    LLAMA_LOG_INFO("%s: setting backend sampler for seq_id %d\n", __func__, config.seq_id);
+                }
             }
         }
     }
@@ -1351,13 +1355,22 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (sampler && can_offload) {
         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
 
-        sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
+        const bool offloaded = sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
+        if (offloaded) {
+            sampling.samplers[seq_id] = sampler;
+            sched_need_reserve = true;
+            return true;
+        }
 
-        sampling.samplers[seq_id] = sampler;
+        // backend_init declined (e.g. grammar with speculative decoding); use CPU sampling
+        LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, backend_init failed, using CPU\n", __func__, llama_sampler_name(sampler), seq_id);
 
-        sched_need_reserve = true;
+        if (sampling.samplers.count(seq_id) > 0) {
+            sched_need_reserve = true;
+        }
+        sampling.samplers.erase(seq_id);
 
-        return true;
+        return false;
     }
 
     if (sampler && !can_offload) {

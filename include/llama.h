@@ -1442,6 +1442,9 @@ extern "C" {
         struct llama_sampler_i * iface;
 
         llama_sampler_context_t ctx;
+
+        // number of ggml nodes in the backend sampling graph, set during .backend_init()
+        uint32_t n_nodes;
     };
 
     // [EXPERIMENTAL]
@@ -1480,6 +1483,9 @@ extern "C" {
 
     // after removing a sampler, the chain will no longer own it, and it will not be freed when the chain is freed
     LLAMA_API struct llama_sampler * llama_sampler_chain_remove(   struct llama_sampler * chain, int32_t i);
+
+    // number of ggml nodes in the backend sampling graph, valid after .backend_init()
+    LLAMA_API uint32_t llama_sampler_backend_n_nodes(const struct llama_sampler * sampler);
 
     // available samplers:
 
