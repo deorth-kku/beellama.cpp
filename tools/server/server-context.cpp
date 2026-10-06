@@ -3765,9 +3765,6 @@ private:
                             }
 
                             if (ps_gate) {
-                                // a recurrent model only holds its state at the latest position
-                                const bool has_recurrent = llama_model_is_recurrent(llama_get_model(ctx_tgt));
-
                                 if (slot.wait_prefix_resolved) {
                                     // we already waited for a donor; alias what it has now (or fall back)
                                     slot.wait_prefix_resolved = false;
@@ -3874,7 +3871,7 @@ private:
                                         }
 
                                         // a donor still prefilling can grow to n_full; remember the best one to wait for
-                                        if (ps_wait && !has_recurrent && other.state == SLOT_STATE_PROCESSING_PROMPT &&
+                                        if (ps_wait && other.state == SLOT_STATE_PROCESSING_PROMPT &&
                                             n_full > n_cur && n_full > n_wait_target) {
                                             n_wait_target = n_full;
                                             donor_wait = &other;
@@ -3882,7 +3879,7 @@ private:
                                     }
 
                                     // wait for a donor to finish prefilling the shared prefix before aliasing it
-                                    const bool do_wait = ps_wait && !has_recurrent && donor_wait &&
+                                    const bool do_wait = ps_wait && donor_wait &&
                                         n_wait_target >= slot.task->params.n_prefix_share && n_wait_target > n_past;
 
                                     if (do_wait) {
