@@ -3625,6 +3625,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_REUSE"));
     add_opt(common_arg(
+        {"--prefix-share"}, "N",
+        string_format(
+            "min shared prompt prefix length to alias KV cells from another slot, requires --kv-unified (default: %d)",
+            params.n_prefix_share
+        ),
+        [](common_params & params, int value) {
+            params.n_prefix_share = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFIX_SHARE"));
+    add_opt(common_arg(
+        {"--prefix-share-wait"}, "MS",
+        string_format(
+            "max time in ms to wait for a donor slot to finish prefilling the shared prefix before aliasing it, "
+            "a negative value waits indefinitely, requires --prefix-share (default: %d)",
+            params.n_prefix_share_wait
+        ),
+        [](common_params & params, int value) {
+            params.n_prefix_share_wait = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFIX_SHARE_WAIT"));
+    add_opt(common_arg(
         {"--metrics"},
         string_format("enable prometheus compatible metrics endpoint (default: %s)", params.endpoint_metrics ? "enabled" : "disabled"),
         [](common_params & params) {

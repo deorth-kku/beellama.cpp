@@ -4341,6 +4341,16 @@ llama_pos llama_memory_seq_pos_max(
     return mem->seq_pos_max(seq_id);
 }
 
+bool llama_memory_seq_is_shared(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (!mem) {
+        return false;
+    }
+
+    return mem->seq_is_shared(seq_id);
+}
+
 bool llama_memory_can_shift(llama_memory_t mem) {
     if (!mem) {
         return false;

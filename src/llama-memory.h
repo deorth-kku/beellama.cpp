@@ -116,6 +116,9 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    // true if any of the cells belonging to seq_id is also owned by another sequence
+    virtual bool seq_is_shared(llama_seq_id seq_id) const { return false; }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     //

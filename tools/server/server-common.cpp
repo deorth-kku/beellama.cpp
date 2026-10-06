@@ -844,6 +844,22 @@ server_tokens server_tokens::clone() const {
     return res;
 }
 
+server_tokens server_tokens::copy_prefix(size_t n) const {
+    GGML_ASSERT(n <= tokens.size());
+    server_tokens res;
+    res.has_mtmd = has_mtmd;
+    for (size_t i = 0; i < n; ++i) {
+        if (tokens[i] == LLAMA_TOKEN_NULL) {
+            const auto & chunk = find_chunk(i);
+            res.push_back_placeholder(chunk.get());
+            i += mtmd_input_chunk_get_n_tokens(chunk.get()) - 1;
+        } else {
+            res.push_back(tokens[i]);
+        }
+    }
+    return res;
+}
+
 //
 // tokenizer and input processing utils
 //
