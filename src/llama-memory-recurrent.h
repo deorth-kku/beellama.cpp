@@ -52,6 +52,8 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
+    bool seq_is_shared(llama_seq_id seq_id) const override;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     bool prepare(const std::vector<llama_ubatch> & ubatches);
@@ -125,6 +127,10 @@ private:
 
     // true if no layers - can happen if the layer filter removes all layers
     bool is_empty() const;
+
+    // split a shared tail cell so seq_id owns its own copy (copy-on-write).
+    // returns the cell index seq_id now owns, or the existing tail if not shared
+    uint32_t cow_split(llama_seq_id seq_id);
 
     size_t total_size() const;
 
