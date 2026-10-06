@@ -818,6 +818,12 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
+    // Returns true if any of the tokens in the memory belonging to the specified sequence
+    // shares its KV cells with another sequence (i.e. the cells were aliased, not copied)
+    LLAMA_API bool llama_memory_seq_is_shared(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 

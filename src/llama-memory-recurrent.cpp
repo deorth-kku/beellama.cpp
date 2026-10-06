@@ -165,6 +165,43 @@ void llama_memory_recurrent::clear(bool data) {
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
 }
 
+uint32_t llama_memory_recurrent::cow_split(llama_seq_id seq_id) {
+    if (seq_id < 0 || (uint32_t) seq_id >= size) {
+        return 0;
+    }
+    auto & seq_meta = cells[seq_id];
+    const int32_t tail_id = seq_meta.tail;
+    if (tail_id < 0) {
+        return 0;
+    }
+    auto & cell = cells[tail_id];
+    // already owns the cell, nothing to split
+    if (cell.seq_id.size() == 1) {
+        return (uint32_t) tail_id;
+    }
+    // find next empty cell
+    uint32_t next_empty_cell = head;
+    for (uint32_t i = 0; i < size; ++i) {
+        if (next_empty_cell >= size) { next_empty_cell -= size; }
+        auto & c = cells[next_empty_cell];
+        if (c.is_empty()) { break; }
+        next_empty_cell += 1;
+    }
+    auto & empty_cell = cells[next_empty_cell];
+    if (!empty_cell.is_empty()) {
+        // no free cell to split into; keep sharing (should not happen: cache is sized for all seqs)
+        return (uint32_t) tail_id;
+    }
+    // copy old tail into the empty cell
+    empty_cell.pos = cell.pos;
+    empty_cell.src = cell.src;
+    cell.seq_id.erase(seq_id);
+    empty_cell.seq_id.insert(seq_id);
+    GGML_ASSERT(!cell.is_empty()); // has at least one remaining seq_id
+    seq_meta.tail = next_empty_cell;
+    return next_empty_cell;
+}
+
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     uint32_t new_head = size;
 
@@ -193,6 +230,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         return false;
     }
     if (0 <= seq_id) {
+        // split a shared tail cell so the rollback below mutates only this seq's cell
+        cow_split(seq_id);
         int32_t & tail_id = cells[seq_id].tail;
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
@@ -347,6 +386,8 @@ void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
 
     // for Mamba-like or RWKV models, only the pos needs to be shifted
     if (0 <= seq_id && seq_id < (int64_t) size) {
+        // split a shared tail cell so the shift below mutates only this seq's cell
+        cow_split(seq_id);
         const int32_t tail_id = cells[seq_id].tail;
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
@@ -377,6 +418,8 @@ void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
 
     // for Mamba-like or RWKV models, only the pos needs to be changed
     if (0 <= seq_id && seq_id < (int64_t) size) {
+        // split a shared tail cell so the div below mutates only this seq's cell
+        cow_split(seq_id);
         const int32_t tail_id = cells[seq_id].tail;
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
@@ -413,6 +456,20 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     }
 
     return result;
+}
+
+bool llama_memory_recurrent::seq_is_shared(llama_seq_id seq_id) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= size) {
+        return false;
+    }
+
+    const int32_t tail_id = cells[seq_id].tail;
+    if (tail_id < 0) {
+        return false;
+    }
+
+    // the state is shared when the tail cell carries more than one sequence
+    return cells[tail_id].seq_id.size() > 1;
 }
 
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
