@@ -3156,6 +3156,16 @@ private:
 
                     server_slot * slot = plan.id_slot == -1 ? nullptr : get_slot_by_id(plan.id_slot);
 
+                    const bool ps_active = params_base.kv_unified && task.params.n_prefix_share > 0;
+                    if (slot && ps_active && !slot->prompt.tokens.empty()) {
+                        for (auto & s : slots) {
+                            if (!s.is_processing() && s.prompt.tokens.empty()) {
+                                slot = &s;
+                                break;
+                            }
+                        }
+                    }
+
                     //
                     // slot scheduling logic
                     //
@@ -3201,7 +3211,9 @@ private:
                         break; // drop the task
                     }
 
-                    cache_idle_slots();
+                    if (!ps_active) {
+                        cache_idle_slots();
+                    }
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
@@ -4395,7 +4407,7 @@ private:
                                         // can roll this slot back to a position behind the donor's tail
                                         auto & dst_ckpt = slot.prompt.checkpoints;
                                         dst_ckpt.clear();
-                                        for (auto & cur : d->prompt.checkpoints) {
+                                        for (auto &->cur : d->prompt.checkpoints) {
                                             if (cur.pos_max < avail) {
                                                 dst_ckpt.push_back(cur);
                                             }
@@ -4425,21 +4437,6 @@ private:
                                             continue;
                                         }
 
-                                        const bool state_ok =
-                                            other.state == SLOT_STATE_PROCESSING_PROMPT ||
-                                            other.state == SLOT_STATE_DONE_PROMPT ||
-                                            other.state == SLOT_STATE_GENERATING;
-                                        if (!state_ok) {
-                                            continue;
-                                        }
-
-                                        if (!other.task || other.truncated ||
-                                            other.task->is_parent() || other.task->is_child()) {
-                                            SLT_DBG(slot, "prefix-share: reject slot %d (no task / truncated / parent / child)\n",
-                                                    other.id);
-                                            continue;
-                                        }
-
                                         // the donor prefix must be live: it has processed at least one token, and
                                         // (non-SWA) the attention cache is contiguous [0, pos_max]. we do NOT require
                                         // pos_min == 0, because a hybrid (recurrent) model reports pos_min == pos_max
@@ -4451,14 +4448,15 @@ private:
                                             continue;
                                         }
 
+                                        // a slot without a task (idle cache) keeps its prompt in slot.prompt
+                                        const server_tokens & other_tokens = other.task ? other.task->tokens : other.prompt.tokens;
+
                                         // n_full = lcp over the two full prompts (how far the donor can
-                                        // grow to share); n_cur stays capped by pos_max + 1, so the
-                                        // immediate-share path is unaffected by using full prompts here
-                                        const int lcp = (int) other.task->tokens.get_common_prefix(slot.task->tokens);
-                                        const int n_full = std::min(
-                                            lcp,
-                                            std::min((int) other.task->n_tokens(), slot.task->n_tokens() - 1));
-                                        const int n_cur = std::min(n_full, (int) pos_max + 1);
+                                        // grow to share); n_cur stays capped by pos_max + 1, so a donor
+                                        // without a task cannot grow beyond its current cache
+                                        const int lcp = (int) other_tokens.get_common_prefix(slot.task->tokens);
+                                        const int n_full = std::min(lcp, slot.task->n_tokens() - 1);
+                                        const int n_cur  = std::min(n_full, (int) pos_max + 1);
 
                                         SLT_DBG(slot, "prefix-share: slot %d candidate (lcp = %d, donor.n_tokens = %d, pos_max = %d, n_cur = %d, n_full = %d)\n",
                                                 other.id, lcp, (int) other.prompt.n_tokens(), (int) pos_max, n_cur, n_full);
@@ -4469,9 +4467,11 @@ private:
                                         }
 
                                         // a donor still prefilling can grow to n_full; remember the best one to wait for
-                                        if (ps_wait && other.state == SLOT_STATE_PROCESSING_PROMPT &&
+                                        // only a donor with a live, non-shared task can grow its prefix
+                                        if (ps_wait && other.state == SLOT_STATE_PROCESSING_PROMPT && other.task &&
+                                            !other.task->is_parent() && !other.task->is_child() &&
                                             n_full > n_cur && n_full > n_wait_target) {
-                                            n_wait_target = n_full;
+                                            n_wait_target = std::min(n_full, (int) other.task->n_tokens());
                                             donor_wait = &other;
                                         }
                                     }
@@ -4520,7 +4520,7 @@ private:
                                         // left untouched
                                         auto & dst_ckpt = slot.prompt.checkpoints;
                                         dst_ckpt.clear();
-                                        for (auto & cur : donor->prompt.checkpoints) {
+                                        for (auto &->cur : donor->prompt.checkpoints) {
                                             if (cur.pos_max < n_shared) {
                                                 dst_ckpt.push_back(cur);
                                             }
