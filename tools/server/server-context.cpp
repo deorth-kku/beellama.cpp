@@ -1951,35 +1951,34 @@ private:
     }
 
     // return true if at least one slot has been cleared
-    // TODO: improve logic
-    //       - smarter decision which slot to clear (LRU or longest prompt?)
-    //       - move slot to level 2 cache instead of removing?
-    //       - instead of purging, try to store and resume later?
+    // purges the least recently used idle slot to free KV cells
     bool try_clear_idle_slots() {
-        bool res = false;
-
         if (!params_base.kv_unified) {
-            return res;
+            return false;
         }
+
+        server_slot * lru = nullptr;
+        int64_t t_last = -1;
 
         for (auto & slot : slots) {
             if (slot.is_processing()) {
                 continue;
             }
 
-            if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
-
-                slot.prompt_clear();
-
-                res = true;
-
-                // clear slots one by one
-                break;
+            if (slot.prompt.n_tokens() > 0 && (!lru || slot.t_last_used <= t_last)) {
+                t_last = slot.t_last_used;
+                lru = &slot;
             }
         }
 
-        return res;
+        if (lru) {
+            SRV_WRN("purging idle slot %d with %zu tokens (LRU, t_last = %" PRId64 ")\n",
+                    lru->id, lru->prompt.tokens.size(), t_last);
+            lru->prompt_clear();
+            return true;
+        }
+
+        return false;
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -4551,12 +4550,13 @@ private:
         });
 
         if (ret != 0) {
+            // try to free space by purging the LRU idle slot
+            const bool cleared = try_clear_idle_slots();
+
             {
                 std::string err;
 
-                if (n_batch == 1 && ret == 1) {
-                    // TODO: try to terminate only the largest active slot/sequence and continue with the rest
-                    //       need to remove the tokens from the current batch too
+                if (n_batch == 1 && ret == 1 && !cleared) {
                     err = "Context size has been exceeded.";
                 }
 
@@ -4590,9 +4590,9 @@ private:
                 }
             }
 
-            // retry with half the batch size to try to find a free slot in the KV cache
-            if (!try_clear_idle_slots()) {
-                n_batch /= 2;
+            // only shrink the batch if we did not free a slot
+            if (!cleared) {
+                n_batch = std::max(1, n_batch / 2);
             }
 
             SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
