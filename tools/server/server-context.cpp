@@ -1832,6 +1832,22 @@ private:
             }
         }
 
+        // when prefix-share is enabled, prefer an empty slot (never used or erased) so the
+        // non-empty slots keep their KV for later requests; aliasing from an empty slot costs
+        // the same as from an LCP slot
+        if (ret == nullptr && task.params.n_prefix_share > 0) {
+            for (server_slot & slot : slots) {
+                if (slot.is_processing()) {
+                    continue;
+                }
+
+                if (slot.prompt.tokens.empty()) {
+                    SLT_INF(slot, "selected empty slot for prefix-share, t_last = %" PRId64 "\n", slot.t_last_used);
+                    return &slot;
+                }
+            }
+        }
+
         // find the slot that has at least n% prompt similarity
         if (slot_prompt_similarity != 0.0f) {
             float f_sim_best = 0;
@@ -2880,6 +2896,9 @@ private:
 
                     const int id_task = task.id;
 
+                    // a prefix-share task wants idle slots to keep their KV as donors
+                    const bool ps_active = params_base.kv_unified && task.params.n_prefix_share > 0;
+
                     server_slot * slot = get_available_slot(task);
 
                     //
@@ -2918,7 +2937,7 @@ private:
                         break; // drop the task
                     }
 
-                    if (params_base.cache_idle_slots) {
+                    if (params_base.cache_idle_slots && !ps_active) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
@@ -3924,21 +3943,6 @@ private:
                                             continue;
                                         }
 
-                                        const bool state_ok =
-                                            other.state == SLOT_STATE_PROCESSING_PROMPT ||
-                                            other.state == SLOT_STATE_DONE_PROMPT ||
-                                            other.state == SLOT_STATE_GENERATING;
-                                        if (!state_ok) {
-                                            continue;
-                                        }
-
-                                        if (!other.task || other.truncated ||
-                                            other.task->is_parent() || other.task->is_child()) {
-                                            SLT_DBG(slot, "prefix-share: reject slot %d (no task / truncated / parent / child)\n",
-                                                    other.id);
-                                            continue;
-                                        }
-
                                         // the donor prefix must be live: it has processed at least one token, and
                                         // (non-SWA) the attention cache is contiguous [0, pos_max]. we do NOT require
                                         // pos_min == 0, because a hybrid (recurrent) model reports pos_min == pos_max
@@ -3950,14 +3954,15 @@ private:
                                             continue;
                                         }
 
+                                        // a slot without a task (idle cache) keeps its prompt in slot.prompt
+                                        const server_tokens & other_tokens = other.task ? other.task->tokens : other.prompt.tokens;
+
                                         // n_full = lcp over the two full prompts (how far the donor can
-                                        // grow to share); n_cur stays capped by pos_max + 1, so the
-                                        // immediate-share path is unaffected by using full prompts here
-                                        const int lcp = (int) other.task->tokens.get_common_prefix(slot.task->tokens);
-                                        const int n_full = std::min(
-                                            lcp,
-                                            std::min((int) other.task->n_tokens(), slot.task->n_tokens() - 1));
-                                        const int n_cur = std::min(n_full, (int) pos_max + 1);
+                                        // grow to share); n_cur stays capped by pos_max + 1, so a donor
+                                        // without a task cannot grow beyond its current cache
+                                        const int lcp = (int) other_tokens.get_common_prefix(slot.task->tokens);
+                                        const int n_full = std::min(lcp, slot.task->n_tokens() - 1);
+                                        const int n_cur  = std::min(n_full, (int) pos_max + 1);
 
                                         SLT_DBG(slot, "prefix-share: slot %d candidate (lcp = %d, donor.n_tokens = %d, pos_max = %d, n_cur = %d, n_full = %d)\n",
                                                 other.id, lcp, (int) other.prompt.n_tokens(), (int) pos_max, n_cur, n_full);
@@ -3968,9 +3973,11 @@ private:
                                         }
 
                                         // a donor still prefilling can grow to n_full; remember the best one to wait for
-                                        if (ps_wait && other.state == SLOT_STATE_PROCESSING_PROMPT &&
+                                        // only a donor with a live, non-shared task can grow its prefix
+                                        if (ps_wait && other.state == SLOT_STATE_PROCESSING_PROMPT && other.task &&
+                                            !other.task->is_parent() && !other.task->is_child() &&
                                             n_full > n_cur && n_full > n_wait_target) {
-                                            n_wait_target = n_full;
+                                            n_wait_target = std::min(n_full, (int) other.task->n_tokens());
                                             donor_wait = &other;
                                         }
                                     }
