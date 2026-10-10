@@ -194,9 +194,17 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
+    // the [head, tail] cell range of the slot's sequence, valid for single-stream slots
+    // used to shrink the K/V view to the slot's own span instead of the full pool
+    std::pair<uint32_t, uint32_t> get_kv_span(const slot_info & sinfo, const llama_ubatch & ubatch) const;
+
+    // the padded n_kv for a slot span [head, tail], single-stream only
+    uint32_t get_n_kv_span(uint32_t head, uint32_t tail) const;
+
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    // head: the first cell of the slot's span, used to offset the view (single-stream only)
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t head = 0) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t head = 0) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -235,7 +243,8 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // head: the first cell of the slot's span, used to offset the mask (single-stream only)
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t head = 0) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -472,4 +481,8 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // the first cell of the slot's span, used to offset the K/V view and the mask
+    // only meaningful for single-stream (unified) slots, 0 otherwise
+    uint32_t n_kv_head = 0;
 };
