@@ -48,3 +48,39 @@ inline bool is_pure_causal_mask(const void * data, ggml_type type, int64_t n_kv,
     }
     return true;
 }
+
+// Check that every element in `data` is either keep (0.0) or drop (-inf),
+// and pack the result into `bits` (1 bit per element: 0 = keep, 1 = drop).
+// `data` must hold `n_elements` elements of `type`, contiguous.
+// On success, `bits` has ceil(n_elements / 8) bytes.
+inline bool is_binary_mask(const void * data, ggml_type type, int64_t n_elements, std::vector<uint8_t> & bits) {
+    bits.assign((n_elements + 7) / 8, 0);
+    if (type == GGML_TYPE_F16) {
+        const uint16_t * p = (const uint16_t *) data;
+        for (int64_t i = 0; i < n_elements; i++) {
+            uint16_t v = p[i];
+            if (v == 0x0000) {
+                // keep, bit stays 0
+            } else if (v == 0xFC00) {
+                bits[i / 8] |= (uint8_t)(1u << (i & 7));
+            } else {
+                return false;
+            }
+        }
+    } else if (type == GGML_TYPE_F32) {
+        const uint32_t * p = (const uint32_t *) data;
+        for (int64_t i = 0; i < n_elements; i++) {
+            uint32_t v = p[i];
+            if (v == 0x00000000u) {
+                // keep, bit stays 0
+            } else if (v == 0xFF800000u) {
+                bits[i / 8] |= (uint8_t)(1u << (i & 7));
+            } else {
+                return false;
+            }
+        }
+    } else {
+        return false;
+    }
+    return true;
+}
