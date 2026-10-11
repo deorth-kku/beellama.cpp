@@ -80,6 +80,7 @@ enum rpc_cmd {
     RPC_CMD_COMM_ALLREDUCE,
     RPC_CMD_COMM_FREE,
     RPC_CMD_FILL_CAUSAL_MASK,
+    RPC_CMD_SET_MASK_BITS,
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -936,7 +937,40 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
             return;
         }
         // not a pure causal prefix (SWA / empty cells / alibi / multi-stream) -
-        // fall through to the normal data path below, behavior unchanged
+        // fall through to the binary-mask path below
+    }
+    // Fast path 2: the mask is binary (every element is 0.0 or -inf) but not
+    // a simple causal prefix (e.g. prefix-share, SWA holes). Compress to 1 bit
+    // per element (1/16 the f16 traffic) and let the worker expand locally.
+    if (offset == 0
+        && size == (size_t) ggml_nbytes(tensor)
+        && size >= 1024 * 1024
+        && tensor->name[0] != '\0'
+        && strstr(tensor->name, "mask") != nullptr
+        && (tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_F32)
+        && tensor->ne[2] == 1
+        && tensor->ne[3] == 1
+        && tensor->nb[0] == (size_t) ggml_type_size(tensor->type)
+        && tensor->nb[1] == tensor->nb[0] * tensor->ne[0]
+        && tensor->nb[2] == tensor->nb[1] * tensor->ne[1]
+        && !rpc_mask_fill_disabled()
+        && rpc_proto_minor(ctx->endpoint) >= 2) {
+        const int64_t n_elements = (int64_t) tensor->ne[0] * tensor->ne[1];
+        std::vector<uint8_t> bits;
+        if (is_binary_mask(data, tensor->type, n_elements, bits)) {
+            size_t payload_size = sizeof(rpc_tensor) + sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint64_t) + bits.size();
+            uint8_t * payload = new uint8_t[payload_size]();
+            memcpy(payload, &rpc_tensor, sizeof(rpc_tensor));
+            memcpy(payload + sizeof(rpc_tensor), &offset, sizeof(offset));
+            memcpy(payload + sizeof(rpc_tensor) + sizeof(offset), &size, sizeof(size));
+            uint64_t n_elem_u64 = (uint64_t) n_elements;
+            memcpy(payload + sizeof(rpc_tensor) + sizeof(offset) + sizeof(size), &n_elem_u64, sizeof(n_elem_u64));
+            memcpy(payload + sizeof(rpc_tensor) + sizeof(offset) + sizeof(size) + sizeof(uint64_t), bits.data(), bits.size());
+            auto input_ptr = std::shared_ptr<uint8_t>(payload, std::default_delete<uint8_t[]>());
+            ctx->dispatcher->send(RPC_CMD_SET_MASK_BITS, input_ptr, payload_size);
+            return;
+        }
+        // not a binary mask (alibi scores, NaN, ...) - fall through to data path
     }
     uint8_t cache_flag = 0;
     LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %s\n", __func__, rpc_log_format_tensor(tensor).c_str(), offset,
@@ -1495,6 +1529,7 @@ public:
     bool set_tensor(const std::vector<uint8_t> & input);
     bool set_tensor_2d(const std::vector<uint8_t> & input);
     bool fill_causal_mask(const std::vector<uint8_t> & input);
+    bool set_mask_bits(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::vector<uint8_t> & response);
@@ -2001,6 +2036,92 @@ bool rpc_server::fill_causal_mask(const std::vector<uint8_t> & input) {
             std::fill(row, row + keep_n, uint32_t(0x00000000)); // +0.0
             std::fill(row + keep_n, row + in_tensor->ne[0], uint32_t(0xFF800000)); // -inf
             row += in_tensor->ne[0];
+        }
+    }
+    ggml_backend_tensor_set(tensor, host.data(), offset, size);
+    return true;
+}
+
+// Worker-side counterpart of the client's SET_MASK_BITS fast path.
+// Serialization format: | rpc_tensor | offset (8) | size (8) | n_elements (8) | bits (ceil(n/8)) |
+// The client has verified every element is 0.0 or -inf; expand the bit array
+// back to full-width floats and push to the backend.
+bool rpc_server::set_mask_bits(const std::vector<uint8_t> & input) {
+    const size_t header_size = sizeof(rpc_tensor) + sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint64_t);
+    if (input.size() < header_size) {
+        return false;
+    }
+    const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
+    uint64_t offset = 0;
+    uint64_t size   = 0;
+    uint64_t n_elements = 0;
+    memcpy(&offset,      input.data() + sizeof(rpc_tensor), sizeof(offset));
+    memcpy(&size,        input.data() + sizeof(rpc_tensor) + sizeof(uint64_t), sizeof(size));
+    memcpy(&n_elements,  input.data() + sizeof(rpc_tensor) + 2 * sizeof(uint64_t), sizeof(n_elements));
+    const size_t bits_size = (n_elements + 7) / 8;
+    if (input.size() < header_size + bits_size) {
+        return false;
+    }
+    const uint8_t * bits = input.data() + header_size;
+
+    const size_t es = ggml_type_size((ggml_type) in_tensor->type);
+    if (in_tensor->type != GGML_TYPE_F16 && in_tensor->type != GGML_TYPE_F32) {
+        GGML_LOG_ERROR("[%s] unsupported type %u\n", __func__, in_tensor->type);
+        return false;
+    }
+    if (es == 0 || in_tensor->ne[0] == 0 || in_tensor->ne[2] != 1 || in_tensor->ne[3] != 1
+        || (uint64_t) in_tensor->ne[0] * in_tensor->ne[1] != n_elements
+        || (uint64_t) n_elements * es != size
+        || in_tensor->nb[0] != es || in_tensor->nb[1] != in_tensor->nb[0] * in_tensor->ne[0] || in_tensor->nb[2] != in_tensor->nb[1] * in_tensor->ne[1]) {
+        GGML_LOG_ERROR("[%s] layout mismatch (ne=[%u,%u,%u,%u], nb=[%u,%u,%u,%u], n_elements=%llu, size=%llu)\n",
+                       __func__, in_tensor->ne[0], in_tensor->ne[1], in_tensor->ne[2], in_tensor->ne[3],
+                       in_tensor->nb[0], in_tensor->nb[1], in_tensor->nb[2], in_tensor->nb[3],
+                       (unsigned long long) n_elements, (unsigned long long) size);
+        return false;
+    }
+
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * tensor = deserialize_tensor(ctx, in_tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+
+    // sanitize tensor->data (same bounds check as set_tensor)
+    {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+        if (in_tensor->data + offset < p0 || in_tensor->data + offset >= p1 || size > (p1 - in_tensor->data - offset)) {
+            GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu) out of buffer bounds [0x%zx, 0x%zx)\n",
+                           __func__, in_tensor->data, offset, size, p0, p1);
+            return false;
+        }
+    }
+
+    LOG_DBG("[%s] name: %s, offset: %" PRIu64 ", size: %zu, n_elements: %llu\n",
+            __func__, tensor->name, offset, size, (unsigned long long) n_elements);
+
+    // Expand bits to full-width floats.
+    // Must write 0x0000 / 0xFC00 (f16) or 0x00000000 / 0xFF800000 (f32)
+    // element-by-element; memset would produce NaN.
+    static thread_local std::vector<uint8_t> host;
+    host.resize(size);
+    if (in_tensor->type == GGML_TYPE_F16) {
+        uint16_t * p = (uint16_t *) host.data();
+        for (uint64_t i = 0; i < n_elements; i++) {
+            p[i] = (bits[i / 8] & (1u << (i & 7))) ? uint16_t(0xFC00) : uint16_t(0x0000);
+        }
+    } else {
+        uint32_t * p = (uint32_t *) host.data();
+        for (uint64_t i = 0; i < n_elements; i++) {
+            p[i] = (bits[i / 8] & (1u << (i & 7))) ? uint32_t(0xFF800000u) : uint32_t(0x00000000u);
         }
     }
     ggml_backend_tensor_set(tensor, host.data(), offset, size);
@@ -2829,6 +2950,16 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.fill_causal_mask(input)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_MASK_BITS: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                if (!server.set_mask_bits(input)) {
                     return;
                 }
                 break;
