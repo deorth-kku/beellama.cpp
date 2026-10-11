@@ -113,6 +113,89 @@ int main() {
         assert(!is_pure_causal_mask(data.data(), GGML_TYPE_I32, N_KV, 1, boundaries));
     }
 
+    // ---- is_binary_mask: F16 ----
+    {
+        // all keep
+        std::vector<uint16_t> data(N_KV, 0x0000);
+        std::vector<uint8_t> bits;
+        assert(is_binary_mask(data.data(), GGML_TYPE_F16, N_KV, bits));
+        assert(bits.size() == 1);
+        assert(bits[0] == 0x00);
+    }
+    {
+        // all drop
+        std::vector<uint16_t> data(N_KV, 0xFC00);
+        std::vector<uint8_t> bits;
+        assert(is_binary_mask(data.data(), GGML_TYPE_F16, N_KV, bits));
+        assert(bits[0] == 0xFF);
+    }
+    {
+        // mixed: first 4 keep, last 4 drop
+        std::vector<uint16_t> data = { 0x0000, 0x0000, 0x0000, 0x0000, 0xFC00, 0xFC00, 0xFC00, 0xFC00 };
+        std::vector<uint8_t> bits;
+        assert(is_binary_mask(data.data(), GGML_TYPE_F16, N_KV, bits));
+        assert(bits[0] == 0xF0);
+    }
+    {
+        // non-binary value (0x3C00 = +1.0) must be rejected
+        std::vector<uint16_t> data = { 0x0000, 0x3C00, 0x0000, 0x0000, 0xFC00, 0xFC00, 0xFC00, 0xFC00 };
+        std::vector<uint8_t> bits;
+        assert(!is_binary_mask(data.data(), GGML_TYPE_F16, N_KV, bits));
+    }
+    {
+        // NaN (0x7E00) must be rejected
+        std::vector<uint16_t> data = { 0x0000, 0x7E00, 0x0000, 0x0000, 0xFC00, 0xFC00, 0xFC00, 0xFC00 };
+        std::vector<uint8_t> bits;
+        assert(!is_binary_mask(data.data(), GGML_TYPE_F16, N_KV, bits));
+    }
+    {
+        // -1.0 (0xFC00 is -inf, 0xBF80 is -1.0) must be rejected
+        std::vector<uint16_t> data = { 0x0000, 0xBF80, 0x0000, 0x0000, 0xFC00, 0xFC00, 0xFC00, 0xFC00 };
+        std::vector<uint8_t> bits;
+        assert(!is_binary_mask(data.data(), GGML_TYPE_F16, N_KV, bits));
+    }
+
+    // ---- is_binary_mask: F32 ----
+    {
+        // mixed: first 4 keep, last 4 drop
+        std::vector<uint32_t> data = { 0, 0, 0, 0, 0xFF800000u, 0xFF800000u, 0xFF800000u, 0xFF800000u };
+        std::vector<uint8_t> bits;
+        assert(is_binary_mask(data.data(), GGML_TYPE_F32, N_KV, bits));
+        assert(bits[0] == 0xF0);
+    }
+    {
+        // non-binary: +1.0 (0x3F800000) must be rejected
+        std::vector<uint32_t> data = { 0, 0x3F800000u, 0, 0, 0xFF800000u, 0xFF800000u, 0xFF800000u, 0xFF800000u };
+        std::vector<uint8_t> bits;
+        assert(!is_binary_mask(data.data(), GGML_TYPE_F32, N_KV, bits));
+    }
+    {
+        // NaN (0xFFFFFFFF) must be rejected
+        std::vector<uint32_t> data = { 0, 0xFFFFFFFFu, 0, 0, 0xFF800000u, 0xFF800000u, 0xFF800000u, 0xFF800000u };
+        std::vector<uint8_t> bits;
+        assert(!is_binary_mask(data.data(), GGML_TYPE_F32, N_KV, bits));
+    }
+
+    // ---- is_binary_mask: unsupported type ----
+    {
+        std::vector<int32_t> data(N_KV, 0);
+        std::vector<uint8_t> bits;
+        assert(!is_binary_mask(data.data(), GGML_TYPE_I32, N_KV, bits));
+    }
+
+    // ---- is_binary_mask: multi-byte span (n_elements > 8) ----
+    {
+        // 16 elements: 8 keep + 8 drop
+        std::vector<uint16_t> data(16);
+        for (int i = 0; i < 8; i++) data[i] = 0x0000;
+        for (int i = 8; i < 16; i++) data[i] = 0xFC00;
+        std::vector<uint8_t> bits;
+        assert(is_binary_mask(data.data(), GGML_TYPE_F16, 16, bits));
+        assert(bits.size() == 2);
+        assert(bits[0] == 0x00);
+        assert(bits[1] == 0xFF);
+    }
+
     std::printf("test-rpc-mask: all tests passed\n");
     return 0;
 }
