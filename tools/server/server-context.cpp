@@ -1356,6 +1356,9 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        if (params_base.mmproj_vram_swap) {
+            params_base.mmproj_use_gpu = false;
+        }
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -1559,10 +1562,6 @@ private:
                 SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
             }
 
-            if (params_base.mmproj_vram_swap && params_base.mmproj_use_gpu) {
-                params_base.mmproj_vram_swap = false;
-                SRV_WRN("%s\n", "--mmproj-vram-swap is redundant when the projector is offloaded, it will be disabled");
-            }
         }
 
         if (!has_mmproj && params_base.mmproj_vram_swap) {
