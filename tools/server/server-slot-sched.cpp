@@ -389,8 +389,11 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
 
             SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
 
-            // select the current slot if the criteria match
-            if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
+            // select the current slot if the criteria match; on a similarity tie,
+            // prefer the slot with the fewest cached prompt tokens
+            if (f_sim_cur > slot_prompt_similarity &&
+                (f_sim_cur > f_sim_best ||
+                 (f_sim_cur == f_sim_best && ret && slot.prompt->n_tokens() < ret->prompt->n_tokens()))) {
                 f_sim_best = f_sim_cur;
 
                 ret = &slot;
