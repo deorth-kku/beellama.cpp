@@ -824,7 +824,7 @@ void llama_context::sched_release() {
     }
 
     for (auto & res : gf_res_prev) {
-        res.reset();
+        res->reset();
     }
     gf_res_reserve.reset();
     sched.reset();
@@ -857,13 +857,15 @@ void llama_context::sched_reserve() {
 
     gf_res_prev_active = nullptr;
 
+    if (!gf_res_reserve) {
+        gf_res_reserve = std::make_unique<llm_graph_result>(max_nodes);
+    }
     gf_res_reserve->set_max_nodes(max_nodes);
     gf_res_reserve->reset();
     for (auto & res : gf_res_prev) {
         res->set_max_nodes(max_nodes);
         res->reset();
     }
-
     sched_new({
         /*.max_nodes  =*/ max_nodes,
         /*.parallel   =*/ cparams.pipeline_parallel,
