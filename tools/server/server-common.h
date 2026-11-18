@@ -470,9 +470,14 @@ struct server_slot_stats {
     void update_prompt_last() {
         set_prompt_last(ggml_time_us());
     }
-    void update_gen_last() {
+    // returns the time spent since the last call, in us
+    // the first token is measured from the end of the prompt
+    int64_t update_gen_last() {
         GGML_ASSERT(t_prompt_last > 0);
-        t_gen_last = ggml_time_us();
+        const int64_t t = ggml_time_us();
+        const int64_t dt = t - std::max(t_gen_last, t_prompt_last);
+        t_gen_last = t;
+        return dt;
     }
 
     // these are time durations

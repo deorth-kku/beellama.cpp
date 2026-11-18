@@ -5210,6 +5210,7 @@ private:
             const int64_t t_now = ggml_time_us();
 
             slot.stats.n_gen += 1;
+            metrics.predict.count += 1;
 
             if (slot.stats.n_gen == 1) {
                 slot.stats.update_prompt_last();
@@ -5217,7 +5218,7 @@ private:
                 slot.n_gen_last = 0;
             }
 
-            slot.stats.update_gen_last();
+            metrics.predict.time += slot.stats.update_gen_last();
 
             completion_token_output result;
             result.tok          = id;
@@ -5336,7 +5337,7 @@ private:
             }
             slot.spec_is_replay = false;
 
-            slot.stats.update_gen_last();
+            metrics.predict.time += slot.stats.update_gen_last();
 
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
@@ -5372,6 +5373,7 @@ private:
                 }
 
                 slot.stats.n_gen += 1;
+                metrics.predict.count += 1;
 
                 if (!process_token(result, slot)) {
                     slot.print_timings();
@@ -5496,7 +5498,8 @@ private:
         const uint64_t n       = slot.stats.n_gen;
         const uint64_t n_steps = slot.stats.n_gen_steps();
 
-        metrics.predict       .add(n, n_steps, t_us);
+        // count and time are updated inline per token, so they are real-time;
+        // only the steps feed the rate gauge here
         metrics.predict_bucket.add(n, n_steps, t_us);
 
         metrics.n_draft_tokens      += slot.stats.n_draft_tokens;
