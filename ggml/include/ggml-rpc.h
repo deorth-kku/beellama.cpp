@@ -23,6 +23,14 @@ GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);
 
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device);
 
+// bulk weight load over RPC: hash each tensor's data in parallel (n_threads),
+// send one SET_TENSOR_HASH_BATCH, then send the data of the tensors the
+// server does not have cached. Returns false if the buffer is not an RPC
+// buffer or the server predates the batch command (nothing was sent).
+GGML_BACKEND_API bool ggml_backend_buffer_set_tensors_hash_batch(ggml_backend_buffer_t buffer,
+        struct ggml_tensor * const * tensors, const void * const * datas, const size_t * sizes,
+        size_t n_tensors, size_t n_threads);
+
 GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total);
 
 GGML_BACKEND_API void ggml_backend_rpc_start_server(

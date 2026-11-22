@@ -9,6 +9,9 @@
 
 // declared in ggml/src/ggml-backend-impl.h, not on the include path of this module
 extern "C" bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft);
+extern "C" bool ggml_backend_buffer_set_tensors_hash_batch(ggml_backend_buffer_t buffer,
+        ggml_tensor * const * tensors, const void * const * datas, const size_t * sizes,
+        size_t n_tensors, size_t n_threads);
 
 #include <algorithm>
 #include <array>
@@ -18,7 +21,9 @@ extern "C" bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft);
 #include <future>
 #include <regex>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1163,6 +1168,19 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
     return op_supported;
 }
 
+// RPC cache hits still require the client to hash the complete tensor before
+// asking the server for the cached copy. That FNV-1a pass runs at ~1 GB/s per
+// core, so with mmap (stable source bytes) the io-threads workers can hash
+// distinct tensors in parallel; the RPC dispatcher serializes the traffic.
+static bool ggml_buffer_is_rpc(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr) {
+        return false;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buffer);
+    const char * name = buft ? ggml_backend_buft_name(buft) : nullptr;
+    return name != nullptr && std::strncmp(name, "RPC", 3) == 0;
+}
+
 // find the first buffer type in the list that can use the tensor
 static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list) {
     GGML_ASSERT(!buft_list->empty());
@@ -1835,6 +1853,64 @@ bool llama_model_loader::load_all_data(
         }
     }
 
+    // hash large RPC tensors in parallel before the serial loop below
+    // mmap-only: the workers read the source bytes concurrently, so the
+    // pointers must stay valid (a reused staging buffer would not)
+    std::unordered_set<ggml_tensor *> rpc_preloaded;
+    {
+        // must match HASH_THRESHOLD in ggml-rpc: smaller tensors skip the hash path
+        constexpr size_t rpc_hash_threshold = 10 * MiB;
+        const size_t n_threads = n_threads_io > 0 ? (size_t) n_threads_io : std::thread::hardware_concurrency();
+        if (use_mmap && !check_tensors && n_threads > 1) {
+            struct rpc_load_job {
+                ggml_tensor * tensor;
+                const void  * data;
+                size_t        size;
+            };
+            std::vector<rpc_load_job> jobs;
+            for (ggml_tensor * tensor : tensors) {
+                const auto * weight = get_weight(ggml_get_name(tensor));
+                if (weight == nullptr || lazy.has(tensor) || tensor->data == nullptr ||
+                        !ggml_buffer_is_rpc(tensor->buffer)) {
+                    continue;
+                }
+                const size_t tensor_size = ggml_nbytes(tensor);
+                if (tensor_size <= rpc_hash_threshold) {
+                    continue;
+                }
+                const auto & mapping = mappings.at(weight->idx);
+                jobs.push_back({tensor, (const uint8_t *) mapping->addr() + weight->offs, tensor_size});
+            }
+            // one batch per RPC endpoint (buffer): hashes are computed in
+            // parallel, then sent in a single SET_TENSOR_HASH_BATCH
+            std::unordered_map<ggml_backend_buffer_t, std::vector<size_t>> jobs_by_buffer;
+            for (size_t i = 0; i < jobs.size(); i++) {
+                jobs_by_buffer[jobs[i].tensor->buffer].push_back(i);
+            }
+            for (auto & [buffer, indices] : jobs_by_buffer) {
+                std::vector<ggml_tensor *> batch_tensors;
+                std::vector<const void *> batch_datas;
+                std::vector<size_t> batch_sizes;
+                batch_tensors.reserve(indices.size());
+                batch_datas.reserve(indices.size());
+                batch_sizes.reserve(indices.size());
+                for (size_t i : indices) {
+                    batch_tensors.push_back(jobs[i].tensor);
+                    batch_datas.push_back(jobs[i].data);
+                    batch_sizes.push_back(jobs[i].size);
+                }
+                // returns false for servers that predate the batch command:
+                // those tensors are left for the serial loop below
+                if (ggml_backend_buffer_set_tensors_hash_batch(buffer, batch_tensors.data(), batch_datas.data(),
+                        batch_sizes.data(), batch_tensors.size(), n_threads)) {
+                    for (size_t i : indices) {
+                        rpc_preloaded.insert(jobs[i].tensor);
+                    }
+                }
+            }
+        }
+    }
+
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1853,6 +1929,11 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        if (rpc_preloaded.find(cur) != rpc_preloaded.end()) {
+            size_done += n_size;
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 

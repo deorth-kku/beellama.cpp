@@ -1016,6 +1016,80 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     ctx->dispatcher->send(RPC_CMD_SET_TENSOR, header, header_size, data, size, nullptr, 0);
 }
 
+// bulk weight load over RPC: hash each tensor's data in parallel (n_threads),
+// send one SET_TENSOR_HASH_BATCH, then send the data of the tensors the server
+// does not have cached (SET_TENSOR with cache_flag=1).
+// gated on the negotiated server proto minor (>= 3, when the batch command
+// was added). Returns false if the buffer is not an RPC buffer or the server
+// predates the batch command (nothing was sent).
+bool ggml_backend_buffer_set_tensors_hash_batch(ggml_backend_buffer_t buffer,
+        ggml_tensor * const * tensors, const void * const * datas, const size_t * sizes,
+        size_t n_tensors, size_t n_threads) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_rpc(buffer)) {
+        return false;
+    }
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *) buffer->context;
+    // SET_TENSOR_HASH_BATCH was added in proto minor 3
+    if (rpc_proto_minor(ctx->endpoint) < 3) {
+        return false;
+    }
+
+    // hash in parallel, each worker takes the next index from the atomic counter
+    std::vector<uint64_t> hashes(n_tensors);
+    {
+        std::atomic<size_t> next {0};
+        std::vector<std::thread> workers;
+        const size_t n_workers = std::min(n_threads, n_tensors);
+        for (size_t t = 0; t < n_workers; t++) {
+            workers.emplace_back([&]() {
+                while (true) {
+                    const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= n_tensors) {
+                        break;
+                    }
+                    hashes[i] = fnv_hash((const uint8_t *) datas[i], sizes[i]);
+                }
+            });
+        }
+        for (auto & worker : workers) {
+            worker.join();
+        }
+    }
+
+    // request format: | n (4 bytes) | n x rpc_msg_set_tensor_hash_req |
+    const size_t request_size = sizeof(uint32_t) + n_tensors * sizeof(rpc_msg_set_tensor_hash_req);
+    uint8_t * request = new uint8_t[request_size];
+    auto request_ptr = std::shared_ptr<const void>(request, [](const void * p) { delete[] (const uint8_t *) p; });
+    uint32_t n = (uint32_t) n_tensors;
+    memcpy(request, &n, sizeof(n));
+    for (size_t i = 0; i < n_tensors; i++) {
+        rpc_msg_set_tensor_hash_req * req =
+            (rpc_msg_set_tensor_hash_req *) (request + sizeof(uint32_t) + i * sizeof(rpc_msg_set_tensor_hash_req));
+        req->tensor = serialize_tensor(tensors[i]);
+        req->offset = 0;
+        req->hash = hashes[i];
+    }
+
+    // response format: | n (4 bytes) | n x result (1 byte each, 1 = hit) |
+    std::vector<uint8_t> response(sizeof(uint32_t) + n_tensors);
+    ctx->dispatcher->send(RPC_CMD_SET_TENSOR_HASH_BATCH, request_ptr, request_size, nullptr, 0, response.data(), response.size());
+    uint32_t rsp_n = 0;
+    memcpy(&rsp_n, response.data(), sizeof(rsp_n));
+    GGML_ASSERT(rsp_n == n_tensors);
+
+    // send the data of the tensors the server does not have cached
+    for (size_t i = 0; i < n_tensors; i++) {
+        if (response[sizeof(uint32_t) + i] != 0) {
+            continue; // hit, the server wrote its cached copy
+        }
+        LOG_DBG2("[%s] tensor: %s, hash: 0x%" PRIx64 ", cache miss, sending data\n", __func__, tensors[i]->name, hashes[i]);
+        size_t header_size;
+        auto header = serialize_set_tensor(serialize_tensor(tensors[i]), 1, 0, nullptr, 0, header_size);
+        ctx->dispatcher->send(RPC_CMD_SET_TENSOR, header, header_size, datas[i], sizes[i], nullptr, 0);
+    }
+    return true;
+}
+
 static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
