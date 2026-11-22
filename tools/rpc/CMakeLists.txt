@@ -13,6 +13,14 @@ if (LLAMA_BUILD_TESTS AND UNIX AND NOT GGML_BACKEND_DL)
             $<TARGET_FILE:ggml-rpc-server>
             $<TARGET_FILE:test-rpc-multi-server>)
     set_property(TEST test-rpc-multi-server PROPERTY LABELS main)
+    add_executable(test-rpc-hash-batch ${PROJECT_SOURCE_DIR}/tests/test-rpc-hash-batch.cpp)
+    target_link_libraries(test-rpc-hash-batch PRIVATE ggml)
+    add_test(
+        NAME test-rpc-hash-batch
+        COMMAND bash ${PROJECT_SOURCE_DIR}/tests/test-rpc-hash-batch.sh
+            $<TARGET_FILE:ggml-rpc-server>
+            $<TARGET_FILE:test-rpc-hash-batch>)
+    set_property(TEST test-rpc-hash-batch PROPERTY LABELS main)
     add_executable(test-rpc-unreachable ${PROJECT_SOURCE_DIR}/tests/test-rpc-unreachable.cpp)
     target_link_libraries(test-rpc-unreachable PRIVATE ggml ggml-rpc)
     target_include_directories(test-rpc-unreachable PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)

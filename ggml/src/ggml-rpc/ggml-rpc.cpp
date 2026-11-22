@@ -9,6 +9,7 @@
 #include <array>
 #include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <thread>
@@ -81,6 +82,7 @@ enum rpc_cmd {
     RPC_CMD_COMM_FREE,
     RPC_CMD_FILL_CAUSAL_MASK,
     RPC_CMD_SET_MASK_BITS,
+    RPC_CMD_SET_TENSOR_HASH_BATCH,
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -112,6 +114,7 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
         case RPC_CMD_COMM_INIT:         return "COMM_INIT";
         case RPC_CMD_COMM_ALLREDUCE:    return "COMM_ALLREDUCE";
         case RPC_CMD_COMM_FREE:         return "COMM_FREE";
+        case RPC_CMD_SET_TENSOR_HASH_BATCH: return "SET_TENSOR_HASH_BATCH";
         case RPC_CMD_NONE:              return "NONE";
         default:                        return "UNKNOWN";
     }
@@ -158,6 +161,7 @@ struct rpc_msg_hello_req {
 // server feature flags in rpc_msg_hello_rsp::flags
 enum rpc_dispatcher_flags : uint8_t {
     RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH = 1 << 0, // client should try SET_TENSOR_HASH before sending tensor data
+    RPC_DISPATCHER_FLAGS_TENSOR_HASH_BATCH = 1 << 1, // client may batch hash checks in one command
 };
 
 struct rpc_msg_hello_rsp {
@@ -567,6 +571,7 @@ public:
     void work();
 
     bool get_send_tensor_hash() const { return flags & RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH; }
+    bool get_send_tensor_hash_batch() const { return flags & RPC_DISPATCHER_FLAGS_TENSOR_HASH_BATCH; }
 
     ~rpc_dispatcher();
 
@@ -1566,6 +1571,7 @@ public:
     bool fill_causal_mask(const std::vector<uint8_t> & input);
     bool set_mask_bits(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
+    bool set_tensor_hash_batch(const std::vector<uint8_t> & input, std::vector<uint8_t> & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -1632,7 +1638,11 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
-    response.flags = cache_dir ? RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH : 0;
+    response.flags = 0;
+    if (cache_dir) {
+        response.flags |= RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH;
+        response.flags |= RPC_DISPATCHER_FLAGS_TENSOR_HASH_BATCH;
+    }
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
 
@@ -2265,6 +2275,113 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
     }
     ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
     response.result = 1;
+    return true;
+}
+
+// number of threads that load hash-cache shards in parallel
+static size_t rpc_cache_load_threads() {
+    static const size_t n_threads = []() {
+        const char * env = std::getenv("GGML_RPC_CACHE_LOAD_THREADS");
+        if (env == nullptr) {
+            return 4;
+        }
+        int value = std::atoi(env);
+        if (value <= 0) {
+            return 4;
+        }
+        return std::min(value, 64);
+    }();
+    return n_threads;
+}
+
+// request format:  | n (4 bytes) | n x rpc_msg_set_tensor_hash_req |
+// response format: | n (4 bytes) | n x result (1 byte each, 1 = hit) |
+bool rpc_server::set_tensor_hash_batch(const std::vector<uint8_t> & input, std::vector<uint8_t> & response) {
+    if (input.size() < sizeof(uint32_t)) {
+        return false;
+    }
+    uint32_t n;
+    memcpy(&n, input.data(), sizeof(n));
+    const size_t expected = sizeof(n) + (size_t) n * sizeof(rpc_msg_set_tensor_hash_req);
+    if (input.size() != expected) {
+        LOG_ERROR("[%s] bad batch size: %zu vs %zu\n", __func__, input.size(), expected);
+        return false;
+    }
+    const rpc_msg_set_tensor_hash_req * requests = (const rpc_msg_set_tensor_hash_req *) (input.data() + sizeof(n));
+
+    sync_all_backends();
+
+    // each worker owns its ggml_context and file buffer, and writes a
+    // distinct results[i], so no locking is needed
+    std::vector<uint8_t> results(n, 0);
+    std::atomic<bool> failed {false};
+    std::atomic<size_t> next {0};
+    std::vector<std::thread> workers;
+    const size_t n_threads = std::min(rpc_cache_load_threads(), (size_t) n);
+    for (size_t t = 0; t < n_threads; t++) {
+        workers.emplace_back([&]() {
+            while (true) {
+                const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                if (i >= n) {
+                    break;
+                }
+                const rpc_msg_set_tensor_hash_req & request = requests[i];
+
+                struct ggml_init_params params {
+                    /*.mem_size   =*/ ggml_tensor_overhead(),
+                    /*.mem_buffer =*/ NULL,
+                    /*.no_alloc   =*/ true,
+                };
+                ggml_context_ptr ctx_ptr { ggml_init(params) };
+                GGML_ASSERT(ctx_ptr != nullptr);
+                ggml_context * ctx = ctx_ptr.get();
+                ggml_tensor * tensor = deserialize_tensor(ctx, &request.tensor);
+                if (tensor == nullptr || tensor->buffer == nullptr) {
+                    LOG_ERROR("[%s] error deserializing tensor %zu\n", __func__, i);
+                    failed = true;
+                    return;
+                }
+
+                std::vector<uint8_t> cached_file;
+                if (!get_cached_file(request.hash, cached_file)) {
+                    LOG_DBG2("[%s] tensor: %s, offset: %" PRIu64 ", hash: 0x%" PRIx64 ", cache miss\n",
+                            __func__, rpc_log_format_tensor(tensor).c_str(), request.offset, request.hash);
+                    continue;
+                }
+                const size_t size = cached_file.size();
+                LOG_DBG2("[%s] tensor: %s, buffer: %p, data: %p, offset: %" PRIu64 ", size: %s, hash: 0x%" PRIx64 ", cache hit\n",
+                        __func__, rpc_log_format_tensor(tensor).c_str(), (void*)tensor->buffer, tensor->data, request.offset,
+                        rpc_log_format_size(size).c_str(), request.hash);
+
+                // sanitize tensor->data
+                {
+                    const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+                    const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+
+                    if (request.tensor.data + request.offset < p0
+                     || request.tensor.data + request.offset >= p1
+                     || size > (p1 - request.tensor.data - request.offset)) {
+                        LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu, hash=0x%" PRIx64 ") out of buffer bounds [0x%zx, 0x%zx)\n",
+                                       __func__, request.tensor.data, request.offset, size, request.hash, p0, p1);
+                        failed = true;
+                        return;
+                    }
+                }
+                ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
+                results[i] = 1;
+            }
+        });
+    }
+    for (auto & worker : workers) {
+        worker.join();
+    }
+    if (failed) {
+        return false;
+    }
+
+    response.resize(sizeof(n) + n);
+    memcpy(response.data(), &n, sizeof(n));
+    memcpy(response.data() + sizeof(n), results.data(), n);
     return true;
 }
 
@@ -3195,6 +3312,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_TENSOR_HASH_BATCH: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                std::vector<uint8_t> response;
+                if (!server.set_tensor_hash_batch(input, response)) {
+                    return;
+                }
+                if (!send_msg(sock, response.data(), response.size())) {
                     return;
                 }
                 break;
