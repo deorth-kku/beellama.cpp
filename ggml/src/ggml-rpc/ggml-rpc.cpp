@@ -15,6 +15,7 @@
 #include <vector>
 #include <queue>
 #include <type_traits>
+#include <deque>
 #include <condition_variable>
 #include <future>
 #include <memory>
@@ -124,6 +125,19 @@ const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 // Maximum number of graphs cached per device; client and server must use the same value
 // so that both sides clear their caches at the same point in the message stream
 const size_t GRAPH_CACHE_MAX = 1024;
+
+// Number of threads that read cache files and copy them to the device while the
+// client keeps hashing and checking the remaining tensors
+const size_t CACHE_LOAD_WORKERS = []() {
+    const char * env = std::getenv("GGML_RPC_CACHE_LOAD_WORKERS");
+    return env ? std::max(1, atoi(env)) : 1;
+}();
+// Cap on queued + in-flight loads; each holds its file data in RAM until the
+// copy to the device is done
+const size_t CACHE_LOAD_MAX_PENDING = []() {
+    const char * env = std::getenv("GGML_RPC_CACHE_LOAD_MAX_PENDING");
+    return env ? std::max(1, atoi(env)) : 4;
+}();
 
 // ===== FILL_CAUSAL_MASK fast path (attn_inp_kq_mask over RPC) =====
 // The attention kq mask is, for pure-causal single-stream serving, a per-row
@@ -1687,6 +1701,9 @@ public:
         };
         req_ctx.reset(ggml_init(params));
         GGML_ASSERT(req_ctx != nullptr);
+        for (size_t i = 0; i < CACHE_LOAD_WORKERS; i++) {
+            load_workers.emplace_back([this] { load_worker(); });
+        }
     }
     ~rpc_server();
 
@@ -1736,6 +1753,18 @@ private:
     static bool comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tensors);
     static bool comm_bootstrap_exchange(void * user_data, const void * send_buf, void * recv_buf, size_t size);
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
+    // A cached tensor loaded in the background: file read + copy to the device
+    struct tensor_load_task {
+        ggml_context * ctx;
+        ggml_tensor  * tensor;
+        uint64_t       hash;
+        uint64_t       offset;
+        uint64_t       region_start;
+        uint64_t       region_end;
+        std::promise<void> done;
+    };
+    void load_worker();
+    void join_pending(uint64_t region_start, uint64_t region_end);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
 
 
@@ -1770,6 +1799,15 @@ private:
     // SET_TENSOR data is received in chunks through this buffer
     std::vector<uint8_t> set_tensor_buf;
     ggml_context_ptr req_ctx;
+    // Async cache loads: load_queue is picked up by the load_workers, pending
+    // holds everything not yet reaped by join_pending
+    std::mutex                load_mutex;
+    std::condition_variable   load_cv;
+    std::deque<tensor_load_task *> load_queue;
+    std::vector<tensor_load_task *> pending;
+    size_t                    load_active = 0;
+    bool                      load_stop = false;
+    std::vector<std::thread>  load_workers;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -1875,6 +1913,8 @@ bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rp
 }
 
 bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
+    // pending cache loads may still reference the buffer
+    join_pending(0, UINT64_MAX);
     sync_all_backends();
     LOG_DBG2("[%s] remote_ptr: 0x%" PRIx64 "\n", __func__, request.remote_ptr);
     ggml_backend_buffer_t buffer = find_buffer(request.remote_ptr);
@@ -1896,6 +1936,7 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
 }
 
 bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
+    join_pending(0, UINT64_MAX);
     sync_all_backends();
     LOG_DBG2("[%s] remote_ptr: 0x%" PRIx64 ", value: %u\n", __func__, request.remote_ptr, request.value);
     ggml_backend_buffer_t buffer = find_buffer(request.remote_ptr);
@@ -1913,6 +1954,9 @@ bool rpc_server::memset_tensor(const rpc_msg_memset_tensor_req & request) {
     if (!rpc_check_region(__func__, tensor, request.offset, request.size)) {
         return false;
     }
+
+    // a pending cache load may still write this region (same region, new weights)
+    join_pending(request.tensor.data + request.offset, request.tensor.data + request.offset + request.size);
 
     LOG_DBG2("[%s] tensor: %s, buffer: %p, data: %p, offset: %" PRIu64 ", size: %s, value: %u\n",
             __func__, rpc_log_format_tensor(tensor).c_str(), (void *) tensor->buffer, tensor->data, request.offset,
@@ -1996,6 +2040,9 @@ bool rpc_server::set_tensor(socket_ptr sock, uint64_t input_size) {
             __func__, rpc_log_format_tensor(tensor).c_str(), (void*)tensor->buffer, tensor->data, offset,
             rpc_log_format_size(size).c_str());
 
+    // a pending cache load may still write this region (same region, new weights)
+    join_pending(request.tensor.data + offset, request.tensor.data + offset + size);
+
     if (cache_dir && cache_flag) {
         // the whole data is needed to compute the hash
         std::vector<uint8_t> data(size);
@@ -2051,6 +2098,10 @@ bool rpc_server::set_tensor_2d(const std::vector<uint8_t> & input) {
     LOG_DBG2("[%s] tensor: %s, buffer: %p, data: %p, offset: %" PRIu64 ", size: %s, n_copies: %" PRIu64 ", stride: %" PRIu64 "\n",
             __func__, rpc_log_format_tensor(tensor).c_str(), (void*)tensor->buffer, tensor->data, request.offset,
             rpc_log_format_size(request.size).c_str(), request.n_copies, request.stride);
+
+    // a pending cache load may still write this region (same region, new weights)
+    const uint64_t span = (request.n_copies - 1) * request.stride + request.size;
+    join_pending(request.tensor.data + request.offset, request.tensor.data + request.offset + span);
 
     ggml_backend_tensor_set_2d(tensor, data, request.offset, request.size, request.n_copies, request.stride, request.size);
     return true;
@@ -2263,22 +2314,90 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
     return true;
 }
 
+void rpc_server::load_worker() {
+    while (true) {
+        tensor_load_task * task = nullptr;
+        {
+            std::unique_lock lk(load_mutex);
+            load_cv.wait(lk, [&] { return load_stop || !load_queue.empty(); });
+            if (load_queue.empty()) {
+                break;
+            }
+            task = load_queue.front();
+            load_queue.pop_front();
+            load_active++;
+        }
+        std::vector<uint8_t> data;
+        if (get_cached_file(task->hash, data)) {
+            LOG_DBG2("[%s] tensor: %s, loading %s from cache\n", __func__, task->tensor->name,
+                     rpc_log_format_size(data.size()).c_str());
+            ggml_backend_tensor_set(task->tensor, data.data(), task->offset, data.size());
+        } else {
+            LOG_WARN("[%s] tensor: %s, cache file for hash 0x%" PRIx64 " disappeared\n",
+                     __func__, task->tensor->name, task->hash);
+        }
+        // the task is reaped by join_pending after this future is waited on
+        task->done.set_value();
+        {
+            std::lock_guard<std::mutex> lk(load_mutex);
+            load_active--;
+            load_cv.notify_all();
+        }
+    }
+}
+
+// wait for the loads whose region intersects [region_start, region_end) and free them
+void rpc_server::join_pending(uint64_t region_start, uint64_t region_end) {
+    std::vector<tensor_load_task *> tasks;
+    {
+        std::lock_guard<std::mutex> lk(load_mutex);
+        for (auto it = pending.begin(); it != pending.end(); ) {
+            tensor_load_task * t = *it;
+            if (t->region_start < region_end && region_start < t->region_end) {
+                tasks.push_back(t);
+                it = pending.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (tensor_load_task * t : tasks) {
+        t->done.get_future().wait();
+        ggml_free(t->ctx);
+        delete t;
+    }
+}
+
 bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
 {
     sync_all_backends();
-    ggml_tensor * tensor = deserialize_tensor(request_ctx(), &request.tensor);
+    // private context: req_ctx is reset per request, but the load worker may
+    // still read task->tensor after this returns
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead()*(1 + GGML_MAX_SRC),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_tensor * tensor = deserialize_tensor(ctx_ptr.get(), &request.tensor);
     if (!rpc_check_region(__func__, tensor, request.offset, 0)) {
         return false;
     }
 
-    std::vector<uint8_t> cached_file;
-    if (!get_cached_file(request.hash, cached_file)) {
+    // The response path only checks that the cache file exists. The file read
+    // and the copy to the device run in load_worker, overlapping with the
+    // client's hash checks for the remaining tensors.
+    char hash_str[17];
+    snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, request.hash);
+    std::error_code ec;
+    const uint64_t size = cache_dir ? fs::file_size(fs::path(cache_dir) / hash_str, ec) : 0;
+    if (ec || size == 0) {
         LOG_DBG2("[%s] tensor: %s, offset: %" PRIu64 ", hash: 0x%" PRIx64 ", cache miss\n",
                 __func__, rpc_log_format_tensor(tensor).c_str(), request.offset, request.hash);
         response.result = 0;
         return true;
     }
-    size_t size = cached_file.size();
     LOG_DBG2("[%s] tensor: %s, buffer: %p, data: %p, offset: %" PRIu64 ", size: %s, hash: 0x%" PRIx64 ", cache hit\n",
             __func__, rpc_log_format_tensor(tensor).c_str(), (void*)tensor->buffer, tensor->data, request.offset,
             rpc_log_format_size(size).c_str(), request.hash);
@@ -2286,7 +2405,37 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
     if (!rpc_check_region(__func__, tensor, request.offset, size)) {
         return false;
     }
-    ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
+
+    tensor_load_task * task = new tensor_load_task();
+    task->ctx = ctx_ptr.release();
+    task->tensor = tensor;
+    task->hash = request.hash;
+    task->offset = request.offset;
+    task->region_start = request.tensor.data + request.offset;
+    task->region_end = task->region_start + size;
+    {
+        std::unique_lock lk(load_mutex);
+        // a load of the same data to the same region is already queued, in
+        // flight or done, so the data is (or will be) in the device buffer
+        for (tensor_load_task * t : pending) {
+            if (t->hash == request.hash && t->region_start == task->region_start && t->region_end == task->region_end) {
+                ggml_free(task->ctx);
+                delete task;
+                response.result = 1;
+                return true;
+            }
+        }
+    }
+    // wait for the loads of this region so that this one lands last
+    join_pending(task->region_start, task->region_end);
+    {
+        std::unique_lock lk(load_mutex);
+        // backpressure: bound the loads holding file data in RAM
+        load_cv.wait(lk, [&] { return load_queue.size() + load_active < CACHE_LOAD_MAX_PENDING; });
+        load_queue.push_back(task);
+        pending.push_back(task);
+        load_cv.notify_one();
+    }
     response.result = 1;
     return true;
 }
@@ -2321,6 +2470,7 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
 }
 
 bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response) {
+    join_pending(0, UINT64_MAX);
     sync_all_backends();
     ggml_tensor * tensor = deserialize_tensor(request_ctx(), &request.tensor);
     if (!rpc_check_region(__func__, tensor, request.offset, request.size)) {
@@ -2336,6 +2486,7 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
 }
 
 bool rpc_server::get_tensor_2d(const rpc_msg_tensor_2d_req & request, std::vector<uint8_t> & response) {
+    join_pending(0, UINT64_MAX);
     sync_all_backends();
     ggml_tensor * tensor = deserialize_tensor(request_ctx(), &request.tensor);
     if (!rpc_check_region(__func__, tensor, request.offset, request.size, request.n_copies, request.stride)) {
@@ -2351,6 +2502,7 @@ bool rpc_server::get_tensor_2d(const rpc_msg_tensor_2d_req & request, std::vecto
 }
 
 bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response) {
+    join_pending(0, UINT64_MAX);
     sync_all_backends();
     ggml_context * ctx = request_ctx();
 
@@ -2368,6 +2520,8 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+    // weights may still be loading from the cache; the graph reads them
+    join_pending(0, UINT64_MAX);
     // | rpc_msg_graph_compute_req | nodes (n_nodes * uint64_t) | n_tensors (uint32_t) | tensors (n_tensors * rpc_tensor) |
     rpc_reader reader(input);
     rpc_msg_graph_compute_req request;
@@ -2494,6 +2648,8 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
 }
 
 bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+    // weights may still be loading from the cache; the graph reads them
+    join_pending(0, UINT64_MAX);
     uint32_t device = request.device;
     if (device >= backends.size()) {
         return false;
@@ -2802,6 +2958,7 @@ bool rpc_server::comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tenso
 }
 
 bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
+    join_pending(0, UINT64_MAX);
     if (request.device >= backends.size()) {
         return false;
     }
@@ -2857,6 +3014,17 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    // Wait for cache loads still writing to the buffers freed below
+    join_pending(0, UINT64_MAX);
+    {
+        std::lock_guard<std::mutex> lk(load_mutex);
+        load_stop = true;
+    }
+    load_cv.notify_all();
+    for (auto & worker : load_workers) {
+        worker.join();
+    }
+
     // Wait for outstanding work. Destroying a communicator while its kernels are still running
     // is unsafe.
     sync_all_backends();
@@ -3012,6 +3180,8 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         RPC_PROTO_PATCH_VERSION);
     LOG_INFO("  endpoint       : %s\n", endpoint);
     LOG_INFO("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
+    LOG_INFO("  cache load workers : %zu\n", CACHE_LOAD_WORKERS);
+    LOG_INFO("  cache load max pending : %zu\n", CACHE_LOAD_MAX_PENDING);
     LOG_INFO("Devices:\n");
     for (size_t i = 0; i < n_devices; i++) {
         auto dev = devices[i];
