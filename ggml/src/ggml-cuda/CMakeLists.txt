@@ -115,10 +115,15 @@ if (CUDAToolkit_FOUND)
     file(GLOB   GGML_HEADERS_CUDA "*.cuh")
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
-    file(GLOB   GGML_SOURCES_CUDA "*.cu")
-    file(GLOB   SRCS "template-instances/fattn-tile*.cu")
-    list(APPEND GGML_SOURCES_CUDA ${SRCS})
+    # fattn.cu and its mma template instances are the slowest to compile,
+    # list them first so they start immediately and overlap with the rest
+    set(GGML_SOURCES_CUDA fattn.cu)
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
+    list(APPEND GGML_SOURCES_CUDA ${SRCS})
+    file(GLOB   SRCS "*.cu")
+    list(REMOVE_ITEM SRCS "fattn.cu")
+    list(APPEND GGML_SOURCES_CUDA ${SRCS})
+    file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/mmq*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
