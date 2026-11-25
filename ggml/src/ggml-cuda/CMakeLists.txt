@@ -115,13 +115,19 @@ if (CUDAToolkit_FOUND)
     file(GLOB   GGML_HEADERS_CUDA "*.cuh")
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
-    file(GLOB   GGML_SOURCES_CUDA "*.cu")
+    # fattn.cu and its template instances are the slowest to compile,
+    # list them first so they start immediately and overlap with the rest
+    set(GGML_SOURCES_CUDA fattn.cu)
+
+    ggml_cuda_fattn_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
+    list(APPEND GGML_SOURCES_CUDA ${SRCS})
+
+    file(GLOB   SRCS "*.cu")
+    list(REMOVE_ITEM SRCS "fattn.cu")
+    list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/mmq*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/mmf*.cu")
-    list(APPEND GGML_SOURCES_CUDA ${SRCS})
-
-    ggml_cuda_fattn_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
     ggml_add_backend_library(ggml-cuda
