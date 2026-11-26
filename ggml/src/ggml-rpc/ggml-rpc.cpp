@@ -2170,32 +2170,17 @@ bool rpc_server::fill_causal_mask(const std::vector<uint8_t> & input) {
     }
 
     // Refill the host-side bytes: row i = keep[0..b] + drop[b+1..n_kv-1].
-    // Must use std::fill, not memset: 0xFC00 / 0xFF800000 are multi-byte
-    // patterns; memset(0xFC) / memset(0xFF) would write 0xFCFC / 0xFFFFFFFF,
-    // i.e. NaN instead of -inf.
+    // Must write 0x0000 / 0xFC00 (f16) or 0x00000000 / 0xFF800000 (f32)
+    // element-by-element; memset would produce NaN.
     // Reuse a per-thread scratch buffer: every byte is overwritten below, so
     // a fresh value-initialized allocation (size can be hundreds of MB) would
     // just waste the zeroing plus the alloc/free churn on every ubatch.
     static thread_local std::vector<uint8_t> host;
     host.resize(size);
     if (in_tensor->type == GGML_TYPE_F16) {
-        uint16_t * row = (uint16_t *) host.data();
-        for (uint32_t i = 0; i < n_rows; i++) {
-            const int64_t b = boundaries[i];
-            const size_t keep_n = (size_t) (b + 1);
-            std::fill(row, row + keep_n, uint16_t(0x0000)); // +0.0
-            std::fill(row + keep_n, row + in_tensor->ne[0], uint16_t(0xFC00)); // -inf
-            row += in_tensor->ne[0];
-        }
+        fill_causal_mask_f16((uint16_t *) host.data(), in_tensor->ne[0], n_rows, boundaries);
     } else {
-        uint32_t * row = (uint32_t *) host.data();
-        for (uint32_t i = 0; i < n_rows; i++) {
-            const int64_t b = boundaries[i];
-            const size_t keep_n = (size_t) (b + 1);
-            std::fill(row, row + keep_n, uint32_t(0x00000000)); // +0.0
-            std::fill(row + keep_n, row + in_tensor->ne[0], uint32_t(0xFF800000)); // -inf
-            row += in_tensor->ne[0];
-        }
+        fill_causal_mask_f32((uint32_t *) host.data(), in_tensor->ne[0], n_rows, boundaries);
     }
     ggml_backend_tensor_set(tensor, host.data(), offset, size);
     return true;
@@ -2273,15 +2258,9 @@ bool rpc_server::set_mask_bits(const std::vector<uint8_t> & input) {
     static thread_local std::vector<uint8_t> host;
     host.resize(size);
     if (in_tensor->type == GGML_TYPE_F16) {
-        uint16_t * p = (uint16_t *) host.data();
-        for (uint64_t i = 0; i < n_elements; i++) {
-            p[i] = (bits[i / 8] & (1u << (i & 7))) ? uint16_t(0xFC00) : uint16_t(0x0000);
-        }
+        expand_mask_bits_f16(bits, (uint16_t *) host.data(), n_elements);
     } else {
-        uint32_t * p = (uint32_t *) host.data();
-        for (uint64_t i = 0; i < n_elements; i++) {
-            p[i] = (bits[i / 8] & (1u << (i & 7))) ? uint32_t(0xFF800000u) : uint32_t(0x00000000u);
-        }
+        expand_mask_bits_f32(bits, (uint32_t *) host.data(), n_elements);
     }
     ggml_backend_tensor_set(tensor, host.data(), offset, size);
     return true;

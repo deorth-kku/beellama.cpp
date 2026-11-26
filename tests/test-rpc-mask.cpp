@@ -215,6 +215,80 @@ int main() {
         assert(bits[1] == 0xFF);
     }
 
+    // ---- expand_mask_bits_f16: inverse of is_binary_mask ----
+    {
+        // 18 elements: SIMD path (16) + tail (2); byte 2 only uses bits 0-1
+        const uint8_t bits[3] = { 0xAA, 0x55, 0x03 };
+        std::vector<uint16_t> out(18);
+        expand_mask_bits_f16(bits, out.data(), 18);
+        for (int i = 0; i < 18; i++) {
+            const uint16_t expected = (bits[i / 8] & (1u << (i & 7))) ? uint16_t(0xFC00) : uint16_t(0x0000);
+            assert(out[i] == expected);
+        }
+        // roundtrip: expand -> scan must reproduce the same bits
+        std::vector<uint8_t> bits2;
+        assert(is_binary_mask(out.data(), GGML_TYPE_F16, 18, bits2));
+        assert(bits2.size() == 3);
+        assert(bits2[0] == bits[0] && bits2[1] == bits[1] && bits2[2] == bits[2]);
+    }
+
+    // ---- expand_mask_bits_f32: inverse of is_binary_mask ----
+    {
+        const uint8_t bits[1] = { 0x81 };
+        std::vector<uint32_t> out(8);
+        expand_mask_bits_f32(bits, out.data(), 8);
+        for (int i = 0; i < 8; i++) {
+            const uint32_t expected = (bits[i / 8] & (1u << (i & 7))) ? uint32_t(0xFF800000u) : uint32_t(0x00000000u);
+            assert(out[i] == expected);
+        }
+        std::vector<uint8_t> bits2;
+        assert(is_binary_mask(out.data(), GGML_TYPE_F32, 8, bits2));
+        assert(bits2.size() == 1);
+        assert(bits2[0] == bits[0]);
+    }
+
+    // ---- fill_causal_mask_f16: exercises the SIMD fill (n_kv = 32) ----
+    {
+        const int32_t boundaries[3] = { 19, -1, 31 };
+        std::vector<uint16_t> out(32 * 3);
+        fill_causal_mask_f16(out.data(), 32, 3, boundaries);
+        for (int i = 0; i < 32; i++) {
+            assert(out[0 * 32 + i] == ((i <= 19) ? uint16_t(0x0000) : uint16_t(0xFC00)));
+            assert(out[1 * 32 + i] == uint16_t(0xFC00));
+            assert(out[2 * 32 + i] == uint16_t(0x0000));
+        }
+        // roundtrip: refill -> scan must reproduce the same boundaries
+        std::vector<int32_t> boundaries2;
+        assert(is_pure_causal_mask(out.data(), GGML_TYPE_F16, 32, 3, boundaries2));
+        assert(boundaries2[0] == 19 && boundaries2[1] == -1 && boundaries2[2] == 31);
+    }
+
+    // ---- fill_causal_mask_f16: tail path (n_kv = 8, no SIMD iterations) ----
+    {
+        const int32_t boundaries[2] = { 3, -1 };
+        std::vector<uint16_t> out(N_KV * 2);
+        fill_causal_mask_f16(out.data(), N_KV, 2, boundaries);
+        for (int i = 0; i < N_KV; i++) {
+            assert(out[0 * N_KV + i] == ((i <= 3) ? uint16_t(0x0000) : uint16_t(0xFC00)));
+            assert(out[1 * N_KV + i] == uint16_t(0xFC00));
+        }
+    }
+
+    // ---- fill_causal_mask_f32: exercises the SIMD fill (n_kv = 32) ----
+    {
+        const int32_t boundaries[3] = { 19, -1, 31 };
+        std::vector<uint32_t> out(32 * 3);
+        fill_causal_mask_f32(out.data(), 32, 3, boundaries);
+        for (int i = 0; i < 32; i++) {
+            assert(out[0 * 32 + i] == ((i <= 19) ? uint32_t(0x00000000u) : uint32_t(0xFF800000u)));
+            assert(out[1 * 32 + i] == uint32_t(0xFF800000u));
+            assert(out[2 * 32 + i] == uint32_t(0x00000000u));
+        }
+        std::vector<int32_t> boundaries2;
+        assert(is_pure_causal_mask(out.data(), GGML_TYPE_F32, 32, 3, boundaries2));
+        assert(boundaries2[0] == 19 && boundaries2[1] == -1 && boundaries2[2] == 31);
+    }
+
     std::printf("test-rpc-mask: all tests passed\n");
     return 0;
 }

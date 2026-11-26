@@ -138,3 +138,126 @@ inline bool is_pure_causal_mask(const void * data, ggml_type type, int64_t n_kv,
     const rpc_mask_kind kind = scan_mask(data, type, n_kv, n_rows, bits, boundaries);
     return kind == rpc_mask_kind::PURE_CAUSAL;
 }
+// Worker-side refill helpers (inverse of scan_mask), kept here so the tests
+// can exercise the exact expansion the worker runs.
+
+// Expand packed bits (1 bit/element, 1 = drop) to f16 elements:
+// 0x0000 = keep (+0.0), 0xFC00 = drop (-inf).
+inline void expand_mask_bits_f16(const uint8_t * bits, uint16_t * out, int64_t n_elements) {
+    int64_t i = 0;
+#if defined(__AVX2__)
+    // lane k of `shifts` holds k, so shifting the byte right by lane k
+    // leaves bit k of the byte in lane k
+    const __m256i shifts = _mm256_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    const __m256i one = _mm256_set1_epi16(1);
+    const __m256i drop = _mm256_set1_epi16(0xFC00);
+    for (; i + 16 <= n_elements; i += 16) {
+        // low byte covers elements i..i+7, high byte covers i+8..i+15
+        const uint16_t b = (uint16_t) (bits[i / 8] | (uint16_t (bits[i / 8 + 1]) << 8));
+        const __m256i v = _mm256_set1_epi16(b);
+        __m256i x = _mm256_srlv_epi16(v, shifts);  // lane k = b >> k
+        x = _mm256_and_si256(x, one);              // lane k = bit k of b
+        x = _mm256_mullo_epi16(x, drop);           // 0 -> 0x0000, 1 -> 0xFC00
+        _mm256_storeu_si256((__m256i *) (out + i), x);
+    }
+#endif
+    for (; i < n_elements; i++) {
+        out[i] = (bits[i / 8] & (1u << (i & 7))) ? uint16_t(0xFC00) : uint16_t(0x0000);
+    }
+}
+
+// Expand packed bits (1 bit/element, 1 = drop) to f32 elements:
+// 0x00000000 = keep (+0.0), 0xFF800000 = drop (-inf).
+inline void expand_mask_bits_f32(const uint8_t * bits, uint32_t * out, int64_t n_elements) {
+    int64_t i = 0;
+#if defined(__AVX2__)
+    const __m256i shifts = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    const __m256i one = _mm256_set1_epi32(1);
+    const __m256i drop = _mm256_set1_epi32(0xFF800000);
+    for (; i + 8 <= n_elements; i += 8) {
+        const __m256i v = _mm256_set1_epi32((int32_t) bits[i / 8]);
+        __m256i x = _mm256_srlv_epi32(v, shifts);  // lane k = b >> k
+        x = _mm256_and_si256(x, one);              // lane k = bit k of b
+        x = _mm256_mullo_epi32(x, drop);           // 0 -> 0x00000000, 1 -> 0xFF800000
+        _mm256_storeu_si256((__m256i *) (out + i), x);
+    }
+#endif
+    for (; i < n_elements; i++) {
+        out[i] = (bits[i / 8] & (1u << (i & 7))) ? uint32_t(0xFF800000u) : uint32_t(0x00000000u);
+    }
+}
+
+// Refill a pure causal mask from per-row boundaries: row i is keep for
+// j <= boundaries[i] and drop otherwise (-1 -> whole row drop).
+inline void fill_causal_mask_f16(uint16_t * out, int64_t n_kv, int64_t n_rows, const int32_t * boundaries) {
+#if defined(__AVX2__)
+    const __m256i keep = _mm256_setzero_si256();
+    const __m256i drop = _mm256_set1_epi16(0xFC00);
+    for (int64_t i = 0; i < n_rows; i++) {
+        uint16_t * row = out + i * n_kv;
+        const int64_t keep_n = boundaries[i] + 1;  // -1 -> 0
+        int64_t j = 0;
+        for (; j + 16 <= keep_n; j += 16) {
+            _mm256_storeu_si256((__m256i *) (row + j), keep);
+        }
+        for (; j < keep_n; j++) {
+            row[j] = uint16_t(0x0000);
+        }
+        for (; j + 16 <= n_kv; j += 16) {
+            _mm256_storeu_si256((__m256i *) (row + j), drop);
+        }
+        for (; j < n_kv; j++) {
+            row[j] = uint16_t(0xFC00);
+        }
+    }
+    return;
+#else
+    for (int64_t i = 0; i < n_rows; i++) {
+        uint16_t * row = out + i * n_kv;
+        const int64_t keep_n = boundaries[i] + 1;  // -1 -> 0
+        for (int64_t j = 0; j < keep_n; j++) {
+            row[j] = uint16_t(0x0000);
+        }
+        for (int64_t j = keep_n; j < n_kv; j++) {
+            row[j] = uint16_t(0xFC00);
+        }
+    }
+#endif
+}
+
+// Refill a pure causal mask from per-row boundaries (f32).
+inline void fill_causal_mask_f32(uint32_t * out, int64_t n_kv, int64_t n_rows, const int32_t * boundaries) {
+#if defined(__AVX2__)
+    const __m256i keep = _mm256_setzero_si256();
+    const __m256i drop = _mm256_set1_epi32(0xFF800000);
+    for (int64_t i = 0; i < n_rows; i++) {
+        uint32_t * row = out + i * n_kv;
+        const int64_t keep_n = boundaries[i] + 1;  // -1 -> 0
+        int64_t j = 0;
+        for (; j + 8 <= keep_n; j += 8) {
+            _mm256_storeu_si256((__m256i *) (row + j), keep);
+        }
+        for (; j < keep_n; j++) {
+            row[j] = uint32_t(0x00000000u);
+        }
+        for (; j + 8 <= n_kv; j += 8) {
+            _mm256_storeu_si256((__m256i *) (row + j), drop);
+        }
+        for (; j < n_kv; j++) {
+            row[j] = uint32_t(0xFF800000u);
+        }
+    }
+    return;
+#else
+    for (int64_t i = 0; i < n_rows; i++) {
+        uint32_t * row = out + i * n_kv;
+        const int64_t keep_n = boundaries[i] + 1;  // -1 -> 0
+        for (int64_t j = 0; j < keep_n; j++) {
+            row[j] = uint32_t(0x00000000u);
+        }
+        for (int64_t j = keep_n; j < n_kv; j++) {
+            row[j] = uint32_t(0xFF800000u);
+        }
+    }
+#endif
+}
