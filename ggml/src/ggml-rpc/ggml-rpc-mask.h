@@ -20,99 +20,200 @@ enum class rpc_mask_kind {
     PURE_CAUSAL,  // every row is a keep-prefix then drop (a subset of BINARY)
 };
 
-// Single pass over `data` (n_kv * n_rows elements, row-major, contiguous).
-// If every element is keep (0.0) or drop (-inf), fills `bits` (1 bit/element,
-// 1 = drop) and derives, from `bits`, `boundaries[i]` (index of the last keep
-// element of row i, -1 if the row is all drop) and whether the mask is a pure
-// causal prefix. Returns the kind; on NOT_BINARY, `bits`/`boundaries` are
-// undefined. The data is read once; the boundary derivation reads only the
-// packed bits (n/8 bytes), so the data is never scanned twice.
-inline rpc_mask_kind scan_mask(const void * data, ggml_type type, int64_t n_kv, int64_t n_rows,
-                               std::vector<uint8_t> & bits, std::vector<int32_t> & boundaries) {
-    const int64_t n_elements = n_kv * n_rows;
+// Per-row state, updated while the data is scanned so the boundary and the
+// pure-causal flag come out of the same pass that packs `bits`.
+struct rpc_mask_row_state {
+    int64_t last_keep = -1;  // index of the last keep element seen in the row
+    bool    seen_drop = false;
+    bool    pure = true;     // false once a keep appears after a drop
+};
+
+// Fold one chunk of a row into the row state in O(1). `col` is the column of
+// the first element of the chunk; bit k of `drop_mask` set = element (col + k)
+// is drop; `n` is the number of elements in the chunk (n <= 32).
+inline void rpc_mask_note_chunk(rpc_mask_row_state & st, int64_t col, uint32_t drop_mask, int n) {
+    const uint32_t mask = (n >= 32) ? 0xFFFFFFFFu : ((1u << n) - 1u);
+    const uint32_t keep_mask = (~drop_mask) & mask;
+    if (keep_mask == mask) {
+        // whole chunk is keep
+        st.last_keep = col + n - 1;
+        return;
+    }
+    if (keep_mask != 0) {
+        // index of the highest set bit, without compiler builtins
+        int hi = 0;
+        uint32_t x = keep_mask;
+        if (x >> 16) { hi = 16; x >>= 16; }
+        if (x >> 8)  { hi += 8;  x >>= 8; }
+        if (x >> 4)  { hi += 4;  x >>= 4; }
+        if (x >> 2)  { hi += 2;  x >>= 2; }
+        if (x >> 1)  { hi += 1; }
+        st.last_keep = col + hi;
+        // a keep after a drop: earlier chunks already had a drop, or this
+        // chunk's keeps are not a low-bit prefix (a 0 followed by a 1)
+        if (st.seen_drop || (keep_mask & (keep_mask + 1u)) != 0) {
+            st.pure = false;
+        }
+    }
+    if ((drop_mask & mask) != 0) {
+        st.seen_drop = true;
+    }
+}
+
+// Pack the drop bits of a binary mask (1 bit/element, 1 = drop). The data is
+// known to be binary, so only the drop values are compared.
+inline void rpc_mask_pack_bits(const void * data, ggml_type type, int64_t n_elements, std::vector<uint8_t> & bits) {
     bits.assign((n_elements + 7) / 8, 0);
-    boundaries.assign(n_rows, -1);
+    uint8_t * out = bits.data();
     if (type == GGML_TYPE_F16) {
         const uint16_t * p = (const uint16_t *) data;
-        uint8_t * out = bits.data();
         int64_t i = 0;
 #if defined(__AVX2__)
         for (; i + 16 <= n_elements; i += 16) {
             const __m256i v = _mm256_loadu_si256((const __m256i *) (p + i));
             const __m256i eq_drop = _mm256_cmpeq_epi16(v, _mm256_set1_epi16(0xFC00));
-            const __m256i eq_keep = _mm256_cmpeq_epi16(v, _mm256_setzero_si256());
-            const __m256i bad = _mm256_andnot_si256(_mm256_or_si256(eq_drop, eq_keep), _mm256_set1_epi16(0xFFFF));
-            if (_mm256_movemask_epi8(bad) != 0) {
-                return rpc_mask_kind::NOT_BINARY;
-            }
-            // bit 2k of m is set iff lane k is drop
+            // bit 2k of m is set iff lane k is drop -> pack to bit k
             const uint32_t m = _mm256_movemask_epi8(eq_drop);
-            out[i / 8] = (uint8_t) (((m >> 0) & 1u) << 0 | ((m >> 2) & 1u) << 1 | ((m >> 4) & 1u) << 2 | ((m >> 6) & 1u) << 3 |
-                                    ((m >> 8) & 1u) << 4 | ((m >> 10) & 1u) << 5 | ((m >> 12) & 1u) << 6 | ((m >> 14) & 1u) << 7);
+            out[i / 8]     = (uint8_t) (((m >> 0) & 1u) << 0 | ((m >> 2) & 1u) << 1 | ((m >> 4) & 1u) << 2 | ((m >> 6) & 1u) << 3 |
+                                       ((m >> 8) & 1u) << 4 | ((m >> 10) & 1u) << 5 | ((m >> 12) & 1u) << 6 | ((m >> 14) & 1u) << 7);
             out[i / 8 + 1] = (uint8_t) (((m >> 16) & 1u) << 0 | ((m >> 18) & 1u) << 1 | ((m >> 20) & 1u) << 2 | ((m >> 22) & 1u) << 3 |
-                                        ((m >> 24) & 1u) << 4 | ((m >> 26) & 1u) << 5 | ((m >> 28) & 1u) << 6 | ((m >> 30) & 1u) << 7);
+                                       ((m >> 24) & 1u) << 4 | ((m >> 26) & 1u) << 5 | ((m >> 28) & 1u) << 6 | ((m >> 30) & 1u) << 7);
         }
 #endif
         for (; i < n_elements; i++) {
-            const uint16_t v = p[i];
-            if (v == 0x0000) {
-                // keep, bit stays 0
-            } else if (v == 0xFC00) {
+            if (p[i] == 0xFC00) {
                 out[i / 8] |= (uint8_t) (1u << (i & 7));
-            } else {
-                return rpc_mask_kind::NOT_BINARY;
             }
         }
     } else if (type == GGML_TYPE_F32) {
         const uint32_t * p = (const uint32_t *) data;
-        uint8_t * out = bits.data();
         int64_t i = 0;
 #if defined(__AVX2__)
         for (; i + 8 <= n_elements; i += 8) {
             const __m256i v = _mm256_loadu_si256((const __m256i *) (p + i));
             const __m256i eq_drop = _mm256_cmpeq_epi32(v, _mm256_set1_epi32(0xFF800000));
-            const __m256i eq_keep = _mm256_cmpeq_epi32(v, _mm256_setzero_si256());
-            const __m256i bad = _mm256_andnot_si256(_mm256_or_si256(eq_drop, eq_keep), _mm256_set1_epi32(0xFFFFFFFF));
-            if (_mm256_movemask_epi8(bad) != 0) {
-                return rpc_mask_kind::NOT_BINARY;
-            }
-            // bit 4k of m is set iff lane k is drop
+            // bit 4k of m is set iff lane k is drop -> pack to bit k
             const uint32_t m = _mm256_movemask_epi8(eq_drop);
             out[i / 8] = (uint8_t) (((m >> 0) & 1u) << 0 | ((m >> 4) & 1u) << 1 | ((m >> 8) & 1u) << 2 | ((m >> 12) & 1u) << 3 |
-                                    ((m >> 16) & 1u) << 4 | ((m >> 20) & 1u) << 5 | ((m >> 24) & 1u) << 6 | ((m >> 28) & 1u) << 7);
+                                   ((m >> 16) & 1u) << 4 | ((m >> 20) & 1u) << 5 | ((m >> 24) & 1u) << 6 | ((m >> 28) & 1u) << 7);
         }
 #endif
         for (; i < n_elements; i++) {
-            const uint32_t v = p[i];
-            if (v == 0x00000000u) {
-                // keep, bit stays 0
-            } else if (v == 0xFF800000u) {
+            if (p[i] == 0xFF800000u) {
                 out[i / 8] |= (uint8_t) (1u << (i & 7));
-            } else {
-                return rpc_mask_kind::NOT_BINARY;
             }
+        }
+    }
+}
+
+// Scan a row-major contiguous mask (n_kv * n_rows elements). The boundaries
+// and the kind come out of a single pass over the data (the per-chunk drop
+// masks are folded into the row state, so there is no pass over the packed
+// bits); `bits` (1 bit/element, 1 = drop) is packed afterwards, only when
+// the mask is binary.
+// If every element is keep (0.0) or drop (-inf), fills `bits` and
+// `boundaries[i]` (index of the last keep element of row i, -1 if the row is
+// all drop), and reports whether every row is a keep-prefix.
+// Returns the kind; on NOT_BINARY, `bits`/`boundaries` are undefined.
+inline rpc_mask_kind scan_mask(const void * data, ggml_type type, int64_t n_kv, int64_t n_rows,
+                               std::vector<uint8_t> & bits, std::vector<int32_t> & boundaries) {
+    const int64_t n_elements = n_kv * n_rows;
+    boundaries.assign(n_rows, -1);
+    if (n_elements == 0) {
+        return rpc_mask_kind::PURE_CAUSAL;
+    }
+    bool pure_causal = true;
+
+    // The scan only folds the per-chunk drop masks into the row state; the
+    // bits are packed in one flat pass afterwards (only when binary).
+    if (type == GGML_TYPE_F16) {
+        const uint16_t * p = (const uint16_t *) data;
+        for (int64_t row = 0; row < n_rows; row++) {
+            rpc_mask_row_state st;
+            const int64_t row_base = row * n_kv;
+            int64_t j = 0;
+#if defined(__AVX2__)
+            for (; j + 16 <= n_kv; j += 16) {
+                const __m256i v = _mm256_loadu_si256((const __m256i *) (p + row_base + j));
+                const __m256i eq_drop = _mm256_cmpeq_epi16(v, _mm256_set1_epi16(0xFC00));
+                const __m256i eq_keep = _mm256_cmpeq_epi16(v, _mm256_setzero_si256());
+                const __m256i bad = _mm256_andnot_si256(_mm256_or_si256(eq_drop, eq_keep), _mm256_set1_epi16(0xFFFF));
+                if (_mm256_movemask_epi8(bad) != 0) {
+                    return rpc_mask_kind::NOT_BINARY;
+                }
+                // bit 2k of m is set iff lane k is drop -> pack to bit k
+                const uint32_t m = _mm256_movemask_epi8(eq_drop);
+                const uint32_t drop_mask =
+                    ((m >> 0) & 1u) << 0 | ((m >> 2) & 1u) << 1 | ((m >> 4) & 1u) << 2 | ((m >> 6) & 1u) << 3 |
+                    ((m >> 8) & 1u) << 4 | ((m >> 10) & 1u) << 5 | ((m >> 12) & 1u) << 6 | ((m >> 14) & 1u) << 7 |
+                    ((m >> 16) & 1u) << 8 | ((m >> 18) & 1u) << 9 | ((m >> 20) & 1u) << 10 | ((m >> 22) & 1u) << 11 |
+                    ((m >> 24) & 1u) << 12 | ((m >> 26) & 1u) << 13 | ((m >> 28) & 1u) << 14 | ((m >> 30) & 1u) << 15;
+                rpc_mask_note_chunk(st, j, drop_mask, 16);
+            }
+#endif
+            for (; j < n_kv; j += 32) {
+                uint32_t drop_mask = 0;
+                const int64_t n = (n_kv - j) < 32 ? (n_kv - j) : 32;
+                for (int64_t k = 0; k < n; k++) {
+                    const uint16_t v = p[row_base + j + k];
+                    if (v == 0xFC00) {
+                        drop_mask |= 1u << k;
+                    } else if (v != 0x0000) {
+                        return rpc_mask_kind::NOT_BINARY;
+                    }
+                }
+                rpc_mask_note_chunk(st, j, drop_mask, (int) n);
+            }
+            boundaries[row] = (int32_t) st.last_keep;
+            pure_causal = pure_causal && st.pure;
+        }
+    } else if (type == GGML_TYPE_F32) {
+        const uint32_t * p = (const uint32_t *) data;
+        for (int64_t row = 0; row < n_rows; row++) {
+            rpc_mask_row_state st;
+            const int64_t row_base = row * n_kv;
+            int64_t j = 0;
+#if defined(__AVX2__)
+            for (; j + 8 <= n_kv; j += 8) {
+                const __m256i v = _mm256_loadu_si256((const __m256i *) (p + row_base + j));
+                const __m256i eq_drop = _mm256_cmpeq_epi32(v, _mm256_set1_epi32(0xFF800000));
+                const __m256i eq_keep = _mm256_cmpeq_epi32(v, _mm256_setzero_si256());
+                const __m256i bad = _mm256_andnot_si256(_mm256_or_si256(eq_drop, eq_keep), _mm256_set1_epi32(0xFFFFFFFF));
+                if (_mm256_movemask_epi8(bad) != 0) {
+                    return rpc_mask_kind::NOT_BINARY;
+                }
+                // bit 4k of m is set iff lane k is drop -> pack to bit k
+                const uint32_t m = _mm256_movemask_epi8(eq_drop);
+                const uint32_t drop_mask =
+                    ((m >> 0) & 1u) << 0 | ((m >> 4) & 1u) << 1 | ((m >> 8) & 1u) << 2 | ((m >> 12) & 1u) << 3 |
+                    ((m >> 16) & 1u) << 4 | ((m >> 20) & 1u) << 5 | ((m >> 24) & 1u) << 6 | ((m >> 28) & 1u) << 7;
+                rpc_mask_note_chunk(st, j, drop_mask, 8);
+            }
+#endif
+            for (; j < n_kv; j += 32) {
+                uint32_t drop_mask = 0;
+                const int64_t n = (n_kv - j) < 32 ? (n_kv - j) : 32;
+                for (int64_t k = 0; k < n; k++) {
+                    const uint32_t v = p[row_base + j + k];
+                    if (v == 0xFF800000u) {
+                        drop_mask |= 1u << k;
+                    } else if (v != 0x00000000u) {
+                        return rpc_mask_kind::NOT_BINARY;
+                    }
+                }
+                rpc_mask_note_chunk(st, j, drop_mask, (int) n);
+            }
+            boundaries[row] = (int32_t) st.last_keep;
+            pure_causal = pure_causal && st.pure;
         }
     } else {
         return rpc_mask_kind::NOT_BINARY;
     }
-
-    // Derive boundaries + pure_causal from the packed bits (reads n/8 bytes).
-    bool pure_causal = true;
-    for (int64_t i = 0; i < n_rows; i++) {
-        int64_t b = -1;
-        bool dropped = false;
-        for (int64_t j = 0; j < n_kv; j++) {
-            const int64_t idx = i * n_kv + j;
-            if ((bits[idx / 8] >> (idx & 7)) & 1u) {
-                dropped = true;  // drop
-            } else {
-                if (dropped) pure_causal = false;  // keep after drop
-                b = j;
-            }
-        }
-        boundaries[i] = (int32_t) b;
-    }
-    return pure_causal ? rpc_mask_kind::PURE_CAUSAL : rpc_mask_kind::BINARY;
+    const rpc_mask_kind kind = pure_causal ? rpc_mask_kind::PURE_CAUSAL : rpc_mask_kind::BINARY;
+    // bits are only consumed by the BINARY wire path (and by oversized
+    // PURE_CAUSAL masks that fall back to it), so pack them only now
+    rpc_mask_pack_bits(data, type, n_elements, bits);
+    return kind;
 }
 
 // Check that every element in `data` is either keep (0.0) or drop (-inf),

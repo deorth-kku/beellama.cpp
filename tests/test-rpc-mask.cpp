@@ -215,6 +215,30 @@ int main() {
         assert(bits[1] == 0xFF);
     }
 
+    // ---- n_kv = 40 (> 32, not a multiple of 16): unaligned bit packing and
+    // tail chunks longer than one 32-bit mask ----
+    {
+        const int64_t W = 40;
+        const int64_t b[4] = { W - 1, 5, -1, 7 };
+        std::vector<uint16_t> data(W * 4);
+        for (int64_t i = 0; i < 4; i++) {
+            for (int64_t j = 0; j < W; j++) {
+                data[i * W + j] = (j <= b[i]) ? uint16_t(0x0000) : uint16_t(0xFC00);
+            }
+        }
+        std::vector<int32_t> boundaries;
+        assert(is_pure_causal_mask(data.data(), GGML_TYPE_F16, W, 4, boundaries));
+        assert(boundaries[0] == 39 && boundaries[1] == 5 && boundaries[2] == -1 && boundaries[3] == 7);
+    }
+    {
+        const int64_t W = 40;
+        std::vector<uint16_t> data(W * 2, uint16_t(0xFC00));
+        for (int64_t j = 0; j <= 5; j++) data[j] = uint16_t(0x0000);
+        data[W + 3] = uint16_t(0x0000);  // keep after drop in row 1
+        std::vector<int32_t> boundaries;
+        assert(!is_pure_causal_mask(data.data(), GGML_TYPE_F16, W, 2, boundaries));
+    }
+
     // ---- expand_mask_bits_f16: inverse of is_binary_mask ----
     {
         // 18 elements: SIMD path (16) + tail (2); byte 2 only uses bits 0-1
