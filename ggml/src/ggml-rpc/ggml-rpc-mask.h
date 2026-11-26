@@ -71,7 +71,7 @@ inline void rpc_mask_pack_bits(const void * data, ggml_type type, int64_t n_elem
 #if defined(__AVX2__)
         for (; i + 16 <= n_elements; i += 16) {
             const __m256i v = _mm256_loadu_si256((const __m256i *) (p + i));
-            const __m256i eq_drop = _mm256_cmpeq_epi16(v, _mm256_set1_epi16(0xFC00));
+            const __m256i eq_drop = _mm256_cmpeq_epi16(v, _mm256_set1_epi16((int16_t) 0xFC00));
             // bit 2k of m is set iff lane k is drop -> pack to bit k
             const uint32_t m = _mm256_movemask_epi8(eq_drop);
             out[i / 8]     = (uint8_t) (((m >> 0) & 1u) << 0 | ((m >> 2) & 1u) << 1 | ((m >> 4) & 1u) << 2 | ((m >> 6) & 1u) << 3 |
@@ -135,9 +135,9 @@ inline rpc_mask_kind scan_mask(const void * data, ggml_type type, int64_t n_kv, 
 #if defined(__AVX2__)
             for (; j + 16 <= n_kv; j += 16) {
                 const __m256i v = _mm256_loadu_si256((const __m256i *) (p + row_base + j));
-                const __m256i eq_drop = _mm256_cmpeq_epi16(v, _mm256_set1_epi16(0xFC00));
+                const __m256i eq_drop = _mm256_cmpeq_epi16(v, _mm256_set1_epi16((int16_t) 0xFC00));
                 const __m256i eq_keep = _mm256_cmpeq_epi16(v, _mm256_setzero_si256());
-                const __m256i bad = _mm256_andnot_si256(_mm256_or_si256(eq_drop, eq_keep), _mm256_set1_epi16(0xFFFF));
+                const __m256i bad = _mm256_andnot_si256(_mm256_or_si256(eq_drop, eq_keep), _mm256_set1_epi16((int16_t) 0xFFFF));
                 if (_mm256_movemask_epi8(bad) != 0) {
                     return rpc_mask_kind::NOT_BINARY;
                 }
@@ -247,18 +247,18 @@ inline bool is_pure_causal_mask(const void * data, ggml_type type, int64_t n_kv,
 inline void expand_mask_bits_f16(const uint8_t * bits, uint16_t * out, int64_t n_elements) {
     int64_t i = 0;
 #if defined(__AVX2__)
-    // lane k of `shifts` holds k, so shifting the byte right by lane k
-    // leaves bit k of the byte in lane k
-    const __m256i shifts = _mm256_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    const __m256i one = _mm256_set1_epi16(1);
-    const __m256i drop = _mm256_set1_epi16(0xFC00);
+    const __m256i drop = _mm256_set1_epi16((int16_t) 0xFC00);
     for (; i + 16 <= n_elements; i += 16) {
         // low byte covers elements i..i+7, high byte covers i+8..i+15
         const uint16_t b = (uint16_t) (bits[i / 8] | (uint16_t (bits[i / 8 + 1]) << 8));
-        const __m256i v = _mm256_set1_epi16(b);
-        __m256i x = _mm256_srlv_epi16(v, shifts);  // lane k = b >> k
-        x = _mm256_and_si256(x, one);              // lane k = bit k of b
-        x = _mm256_mullo_epi16(x, drop);           // 0 -> 0x0000, 1 -> 0xFC00
+        // AVX2 has no _mm256_srlv_epi16 (AVX-512BW), so unpack the bits
+        // per lane; lane k = bit k of b
+        alignas(32) uint16_t tmp[16];
+        for (int k = 0; k < 16; ++k) {
+            tmp[k] = (b >> k) & 1u;
+        }
+        __m256i x = _mm256_load_si256((const __m256i *) tmp);
+        x = _mm256_mullo_epi16(x, drop);  // 0 -> 0x0000, 1 -> 0xFC00
         _mm256_storeu_si256((__m256i *) (out + i), x);
     }
 #endif
@@ -293,7 +293,7 @@ inline void expand_mask_bits_f32(const uint8_t * bits, uint32_t * out, int64_t n
 inline void fill_causal_mask_f16(uint16_t * out, int64_t n_kv, int64_t n_rows, const int32_t * boundaries) {
 #if defined(__AVX2__)
     const __m256i keep = _mm256_setzero_si256();
-    const __m256i drop = _mm256_set1_epi16(0xFC00);
+    const __m256i drop = _mm256_set1_epi16((int16_t) 0xFC00);
     for (int64_t i = 0; i < n_rows; i++) {
         uint16_t * row = out + i * n_kv;
         const int64_t keep_n = boundaries[i] + 1;  // -1 -> 0
