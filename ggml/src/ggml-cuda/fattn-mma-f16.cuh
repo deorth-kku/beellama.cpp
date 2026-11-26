@@ -528,22 +528,26 @@ constexpr int FATTN_MMA_FUSED_NONE = 0;
 constexpr int FATTN_MMA_FUSED_Q8_0 = 1;
 constexpr int FATTN_MMA_FUSED_Q4_0 = 2;
 constexpr int FATTN_MMA_FUSED_F8_E4M3 = 3;
-// All three block types cover 32 values per block; f8_e4m3 is 1 B/value, its cache scale applied outside the FA op.
+constexpr int FATTN_MMA_FUSED_Q5_1 = 4;
+// All four block types cover 32 values per block; f8_e4m3 is 1 B/value, its cache scale applied outside the FA op.
 constexpr int FATTN_MMA_Q8_0_BLOCK_BYTES = 34;
 constexpr int FATTN_MMA_Q4_0_BLOCK_BYTES = 18;
 constexpr int FATTN_MMA_F8_E4M3_BLOCK_BYTES = 32;
+constexpr int FATTN_MMA_Q5_1_BLOCK_BYTES = 24; // sizeof(block_q5_1): d + m + qh[4] + qs[16]
 // Staging row bytes per fused type, single source of truth for the load / dequant / alloc-predictor sites.
 static constexpr __host__ __device__ inline int ggml_cuda_fattn_mma_fused_block_bytes(const int fused) {
     return fused == FATTN_MMA_FUSED_Q4_0 ? FATTN_MMA_Q4_0_BLOCK_BYTES :
+           fused == FATTN_MMA_FUSED_Q5_1 ? FATTN_MMA_Q5_1_BLOCK_BYTES :
            fused == FATTN_MMA_FUSED_F8_E4M3 ? FATTN_MMA_F8_E4M3_BLOCK_BYTES : FATTN_MMA_Q8_0_BLOCK_BYTES;
 }
 // Maps a cache type to its fused kernel template arg (the gate rejects anything else up front).
 static constexpr __host__ __device__ inline int ggml_cuda_fattn_mma_fused_type_from_ggml(const ggml_type type) {
     return type == GGML_TYPE_Q4_0 ? FATTN_MMA_FUSED_Q4_0 :
+           type == GGML_TYPE_Q5_1 ? FATTN_MMA_FUSED_Q5_1 :
            type == GGML_TYPE_F8_E4M3 ? FATTN_MMA_FUSED_F8_E4M3 : FATTN_MMA_FUSED_Q8_0;
 }
 static bool ggml_cuda_fattn_mma_fused_type_supported(const ggml_type type) {
-    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_F8_E4M3;
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q5_1 || type == GGML_TYPE_F8_E4M3;
 }
 // Pipelined fused staging: two half-chunks in two slots, same total bytes as one chunk slot (smem and alloc predictor unchanged).
 // The half-chunk row must be whole blocks and 16 B aligned: 8 B cp.async staging (q8_0/q4_0) measured slower than the wait it hides.
@@ -551,8 +555,8 @@ template<int nbatch2, int block_bytes>
 static constexpr __device__ bool ggml_cuda_fattn_mma_fused_stage_pipelined() {
     return nbatch2 % 32 == 0 && (nbatch2 / 2 / 16) * block_bytes % 16 == 0;
 }
-// 8 B cp.async variant for the fused DKQ=DV=128 staging: q8_0/q4_0 rows of a 128-value head are 136/72 B (≡ 8 mod 16), never 16 B
-// aligned like the cache row pitch they read from. .ca supports 4/8/16 B transfers (.cg upstream only 16 B); both pointers need 8 B alignment.
+// 8 B cp.async variant for the fused DKQ=DV=128 staging: q8_0/q4_0 rows of a 128-value head are 136/72 B (≡ 8 mod 16), never
+// 16 B aligned like the cache row pitch they read from. .ca supports 4/8/16 B transfers (.cg upstream only 16 B); both pointers need 8 B alignment.
 static __device__ __forceinline__ void cp_async_ca_8(const unsigned int dst, const void * src) {
 #ifdef CP_ASYNC_AVAILABLE
     asm volatile("cp.async.ca.shared.global [%0], [%1], 8;"
@@ -572,14 +576,14 @@ template<int fused, int nwarps, int nbatch_fa, int D2, bool sparse = false>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_q(
         const char * const __restrict__ KV, char * const __restrict__ stage, const int stride_KV,
         const int k_VKQ_0, const int32_t * const __restrict__ indices, const int i_sup = nbatch_fa) {
-    static_assert(fused == FATTN_MMA_FUSED_Q8_0 || fused == FATTN_MMA_FUSED_Q4_0 || fused == FATTN_MMA_FUSED_F8_E4M3,
+    static_assert(fused == FATTN_MMA_FUSED_Q8_0 || fused == FATTN_MMA_FUSED_Q4_0 || fused == FATTN_MMA_FUSED_Q5_1 || fused == FATTN_MMA_FUSED_F8_E4M3,
         "unhandled fused type");
     constexpr int block_bytes = ggml_cuda_fattn_mma_fused_block_bytes(fused);
     static_assert(D2 % 16 == 0, "fused dequant requires whole quantization blocks");
     constexpr int nblk = D2 / 16;
     constexpr int row_bytes = nblk * block_bytes;
-    // Transfer width by row alignment: 16 B chunks wherever rows are 16 B aligned (q8_0/q4_0 at D >= 256, f8_e4m3 always),
-    // 8 B for the D=128 q8_0/q4_0 rows (136/72 B, see cp_async_ca_8); odd-byte rows excluded below.
+    // Transfer width by row alignment: 16 B chunks wherever rows are 16 B aligned (q8_0/q4_0/q5_1 at D >= 256, f8_e4m3 always),
+    // 8 B for the D=128 q8_0/q4_0/q5_1 rows (136/72/200 B, see cp_async_ca_8); odd-byte rows excluded below.
     static_assert(row_bytes % 8 == 0, "quantized tile rows must be a multiple of 8 B");
     constexpr int copy_bytes = row_bytes % 16 == 0 ? 16 : 8;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -671,6 +675,45 @@ static __device__ __forceinline__ void flash_attn_ext_f16_dequant_tile_q4(
         }
     }
 }
+// Dequantizes the raw q5_1 staging area into an f16 tile with the same swizzle as flash_attn_ext_f16_load_tile.
+// The arithmetic matches dequantize_q5_1, i.e. the result is bit-identical to the standalone f16 conversion.
+template<int stride_tile, int nwarps, int nbatch_fa, int D2>
+static __device__ __forceinline__ void flash_attn_ext_f16_dequant_tile_q5(
+        const char * const __restrict__ stage, half2 * const __restrict__ tile, const int blk_off = 0) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nblk = D2 / 16; // q5_1 blocks per row, 32 values each
+    constexpr int row_bytes = nblk * FATTN_MMA_Q5_1_BLOCK_BYTES;
+#pragma unroll
+    for (int u = threadIdx.y*warp_size + threadIdx.x; u < nbatch_fa*nblk; u += nwarps*warp_size) {
+        const int i = u / nblk;
+        const int j = u % nblk;
+        const char * const b = stage + i*row_bytes + j*FATTN_MMA_Q5_1_BLOCK_BYTES;
+        const float d = __half2float(*(const half *) b);       // offset 0
+        const float m = __half2float(*(const half *) (b + 2)); // offset 2
+        const uint32_t qh = *(const uint32_t *) (b + 4);       // offset 4
+        const uint8_t * const qs = (const uint8_t *) (b + 8);  // offset 8
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            alignas(16) half vals[8];
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                // q<2 reads the low nibbles (values 0..15), q>=2 the high nibbles (values 16..31), same byte
+                // grouping as dequant_tile_q4. Value v takes its 5th bit from qh bit v. Matches dequantize_q5_1.
+                const int off = 8*(q & 1) + 2*l;
+                const int v0 = off + (q < 2 ? 0 : 16);
+                const uint8_t b0 = qs[off];
+                const uint8_t b1 = qs[off + 1];
+                const uint8_t lo0 = q < 2 ? (b0 & 0xF) : (b0 >> 4);
+                const uint8_t lo1 = q < 2 ? (b1 & 0xF) : (b1 >> 4);
+                const uint8_t hi0 = ((qh >> v0) & 1) << 4;
+                const uint8_t hi1 = ((qh >> (v0 + 1)) & 1) << 4;
+                vals[2*l + 0] = __float2half(d * (float) (lo0 | hi0) + m);
+                vals[2*l + 1] = __float2half(d * (float) (lo1 | hi1) + m);
+            }
+            ggml_cuda_memcpy_1<16>(swizzle<stride_tile>(tile, i*stride_tile + (4*(j + blk_off) + q)*4, i), vals);
+        }
+    }
+}
 // Converts two e4m3 bytes (low byte = first value) to half2. e4m3 values are exactly representable in f16, so the
 // hardware cvt is bit-identical to the reference dequantize_row_f8_e4m3 path; the fallback mirrors convert.cuh.
 static __device__ __forceinline__ half2 fattn_f8x2_to_half2(const uint16_t pair) {
@@ -713,12 +756,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_dequant_tile_f8(
 template<int fused, int stride_tile, int nwarps, int nbatch_fa, int D2>
 static __device__ __forceinline__ void flash_attn_ext_f16_dequant_tile_q(
         const char * const __restrict__ stage, half2 * const __restrict__ tile, const int blk_off = 0) {
-    static_assert(fused == FATTN_MMA_FUSED_Q8_0 || fused == FATTN_MMA_FUSED_Q4_0 || fused == FATTN_MMA_FUSED_F8_E4M3,
+    static_assert(fused == FATTN_MMA_FUSED_Q8_0 || fused == FATTN_MMA_FUSED_Q4_0 || fused == FATTN_MMA_FUSED_Q5_1 || fused == FATTN_MMA_FUSED_F8_E4M3,
         "unhandled fused type");
     if constexpr (fused == FATTN_MMA_FUSED_Q8_0) {
         flash_attn_ext_f16_dequant_tile_q8<stride_tile, nwarps, nbatch_fa, D2>(stage, tile, blk_off);
     } else if constexpr (fused == FATTN_MMA_FUSED_Q4_0) {
         flash_attn_ext_f16_dequant_tile_q4<stride_tile, nwarps, nbatch_fa, D2>(stage, tile, blk_off);
+    } else if constexpr (fused == FATTN_MMA_FUSED_Q5_1) {
+        flash_attn_ext_f16_dequant_tile_q5<stride_tile, nwarps, nbatch_fa, D2>(stage, tile, blk_off);
     } else {
         flash_attn_ext_f16_dequant_tile_f8<stride_tile, nwarps, nbatch_fa, D2>(stage, tile, blk_off);
     }
@@ -2539,7 +2584,7 @@ static bool ggml_cuda_fattn_mma_f16_fused_q_supported(
         : (DKQ == DV && (DKQ == 512
             ? (ncols2 == 8 && nstages == 1)
             : (DKQ == 128 || DKQ == 256) && nstages > 1 && (ncols2 == 8 || !use_logit_softcap))); // nstages > 1 excludes ncols2 = 1
-    // Per-side staging alignment (see cp_async_ca_8): 16 B generally; 8 B at DKQ=DV=128 (136/72 B rows).
+    // Per-side staging alignment (see cp_async_ca_8): 16 B generally; 8 B at DKQ=DV=128 (136/72/200 B rows).
     auto align_req_of = [](const ggml_type type, const int D) {
         const int rb = (D/32) * ggml_cuda_fattn_mma_fused_block_bytes(ggml_cuda_fattn_mma_fused_type_from_ggml(type));
         return rb % 16 == 0 ? 16 : 8;
@@ -2553,9 +2598,9 @@ static bool ggml_cuda_fattn_mma_f16_fused_q_supported(
         && (uintptr_t) K->data % align_K == 0 && (uintptr_t) V->data % align_V == 0;
 }
 // The fused kernel instantiation table (K type x V type; use_sparse picks the dense or sparse gather variant); only cells the
-// gate can fuse instantiate either side (see fused_q_supported). The softcap-free 3x3 table serves the sparse calls (sparse
+// gate can fuse instantiate either side (see fused_q_supported). The softcap-free 4x4 table serves the sparse calls (sparse
 // never runs with softcap); the dense cells (128/256/512 at ncols2=8, plus dense softcap-free 128/256 at ncols2=2/4) use the
-// 3x3x2 table with the softcap axis.
+// 4x4x2 table with the softcap axis.
 // One table entry: kernel template args fixed by the enclosing pick instantiation, varying only in the per-side fused
 // K/V quant enums (_SC = softcap twin).
 #define FATTN_MMA_FUSED_CASE(KQ, VQ) \
@@ -2566,32 +2611,46 @@ static bool ggml_cuda_fattn_mma_f16_fused_q_supported(
 template <int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view, bool use_sparse>
 static fattn_kernel_t ggml_cuda_fattn_mma_f16_fused_kernel_pick(const int fused_K, const int fused_V, const bool use_logit_softcap) {
     if constexpr (use_sparse) {
-        // Per-side q8_0/q4_0/f8_e4m3 dequant combinations (K x V), indexed by fused_K/V - 1.
+        // Per-side q8_0/q4_0/q5_1/f8_e4m3 dequant combinations (K x V), indexed by fused_K/V - 1.
         GGML_ASSERT(!use_logit_softcap); // callers only reach this table for softcap-free ops (see above)
-        constexpr fattn_kernel_t fused_kernel_tab_nosc[3][3] = {
+        constexpr fattn_kernel_t fused_kernel_tab_nosc[4][4] = {
             { FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_Q8_0, FATTN_MMA_FUSED_Q8_0),
               FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_Q8_0, FATTN_MMA_FUSED_Q4_0),
-              FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_Q8_0, FATTN_MMA_FUSED_F8_E4M3) },
+              FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_Q8_0, FATTN_MMA_FUSED_F8_E4M3),
+              FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_Q8_0, FATTN_MMA_FUSED_Q5_1) },
             { FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_Q4_0, FATTN_MMA_FUSED_Q8_0),
               FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_Q4_0, FATTN_MMA_FUSED_Q4_0),
-              FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_Q4_0, FATTN_MMA_FUSED_F8_E4M3) },
+              FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_Q4_0, FATTN_MMA_FUSED_F8_E4M3),
+              FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_Q4_0, FATTN_MMA_FUSED_Q5_1) },
             { FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_F8_E4M3, FATTN_MMA_FUSED_Q8_0),
               FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_F8_E4M3, FATTN_MMA_FUSED_Q4_0),
-              FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_F8_E4M3, FATTN_MMA_FUSED_F8_E4M3) },
+              FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_F8_E4M3, FATTN_MMA_FUSED_F8_E4M3),
+              FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_F8_E4M3, FATTN_MMA_FUSED_Q5_1) },
+            { FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_Q5_1, FATTN_MMA_FUSED_Q8_0),
+              FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_Q5_1, FATTN_MMA_FUSED_Q4_0),
+              FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_Q5_1, FATTN_MMA_FUSED_F8_E4M3),
+              FATTN_MMA_FUSED_CASE(FATTN_MMA_FUSED_Q5_1, FATTN_MMA_FUSED_Q5_1) },
         };
         return fused_kernel_tab_nosc[fused_K - 1][fused_V - 1];
     } else {
-        // Per-side q8_0/q4_0/f8_e4m3 dequant combinations (K x V x softcap), indexed by fused_K/V - 1.
-        constexpr fattn_kernel_t fused_kernel_tab[3][3][2] = {
+        // Per-side q8_0/q4_0/q5_1/f8_e4m3 dequant combinations (K x V x softcap), indexed by fused_K/V - 1.
+        constexpr fattn_kernel_t fused_kernel_tab[4][4][2] = {
             { FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_Q8_0, FATTN_MMA_FUSED_Q8_0),
               FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_Q8_0, FATTN_MMA_FUSED_Q4_0),
-              FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_Q8_0, FATTN_MMA_FUSED_F8_E4M3) },
+              FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_Q8_0, FATTN_MMA_FUSED_F8_E4M3),
+              FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_Q8_0, FATTN_MMA_FUSED_Q5_1) },
             { FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_Q4_0, FATTN_MMA_FUSED_Q8_0),
               FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_Q4_0, FATTN_MMA_FUSED_Q4_0),
-              FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_Q4_0, FATTN_MMA_FUSED_F8_E4M3) },
+              FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_Q4_0, FATTN_MMA_FUSED_F8_E4M3),
+              FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_Q4_0, FATTN_MMA_FUSED_Q5_1) },
             { FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_F8_E4M3, FATTN_MMA_FUSED_Q8_0),
               FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_F8_E4M3, FATTN_MMA_FUSED_Q4_0),
-              FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_F8_E4M3, FATTN_MMA_FUSED_F8_E4M3) },
+              FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_F8_E4M3, FATTN_MMA_FUSED_F8_E4M3),
+              FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_F8_E4M3, FATTN_MMA_FUSED_Q5_1) },
+            { FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_Q5_1, FATTN_MMA_FUSED_Q8_0),
+              FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_Q5_1, FATTN_MMA_FUSED_Q4_0),
+              FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_Q5_1, FATTN_MMA_FUSED_F8_E4M3),
+              FATTN_MMA_FUSED_CASE_SC(FATTN_MMA_FUSED_Q5_1, FATTN_MMA_FUSED_Q5_1) },
         };
         return fused_kernel_tab[fused_K - 1][fused_V - 1][use_logit_softcap];
     }
