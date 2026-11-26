@@ -6,6 +6,16 @@ ggml_add_backend_library(ggml-rpc
                          transport.cpp
                         )
 
+# The RPC target is compiled without arch flags (unlike ggml-cpu); follow
+# GGML_AVX2 on x86 so the AVX2 mask-scan path in ggml-rpc-mask.h is used.
+if (GGML_SYSTEM_ARCH STREQUAL "x86" AND GGML_AVX2)
+    if (CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
+        target_compile_options(ggml-rpc PRIVATE /arch:AVX2)
+    else()
+        target_compile_options(ggml-rpc PRIVATE -mavx2)
+    endif()
+endif()
+
 if (WIN32)
     target_link_libraries(ggml-rpc PRIVATE ws2_32)
 endif()

@@ -1036,11 +1036,17 @@ static bool rpc_set_tensor_from_cache(rpc_dispatcher & dispatcher, const ggml_te
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     const rpc_tensor wire = serialize_tensor(tensor);
-    // Fast path: pure-causal attention masks are resent in full every ubatch
-    // (O(n_kv) per ubatch -> O(n^2) over a long prefill). If the data is
-    // verified locally to be a per-row 0/-inf prefix, send only the per-row
-    // boundaries and let the worker refill identical bytes locally.
-    if (offset == 0
+    // Fast path: attention masks are resent in full every ubatch (O(n_kv) per
+    // ubatch -> O(n^2) over a long prefill). If the data is verified locally
+    // to be a binary (0.0 / -inf) mask, compress it and let the worker
+    // re-expand locally:
+    //   - a pure causal prefix sends only the per-row boundaries
+    //     (FILL_CAUSAL_MASK, the smaller payload)
+    //   - any other binary mask sends 1 bit per element (SET_MASK_BITS)
+    // Both are far smaller than the raw f16/f32 data. The mask is scanned
+    // once; the boundary decision is derived from the packed bits.
+    const bool mask_candidate =
+        offset == 0
         && size == (size_t) ggml_nbytes(tensor)
         && size >= 1024 * 1024
         && tensor->name[0] != '\0'
@@ -1052,20 +1058,24 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         // rejected there and tear down the connection instead of falling
         // back to the data path
         && tensor->ne[3] == 1
-        // mirror the worker's limits so values never truncate on the wire
-        // (a truncated n_rows/boundary fails the worker's checks and tears
-        // down the connection instead of falling back to the data path)
-        && tensor->ne[0] <= INT32_MAX
-        && (int64_t) tensor->ne[1] * tensor->ne[3] <= (int64_t) UINT32_MAX
         && tensor->nb[0] == (size_t) ggml_type_size(tensor->type)
         && tensor->nb[1] == tensor->nb[0] * tensor->ne[0]
         && tensor->nb[2] == tensor->nb[1] * tensor->ne[1]
         && !rpc_mask_fill_disabled()
-        && rpc_proto_minor(ctx->endpoint) >= 1) {
+        && rpc_proto_minor(ctx->endpoint) >= 1;
+    if (mask_candidate) {
         const int64_t n_kv   = tensor->ne[0];
-        const int64_t n_rows = tensor->ne[1] * tensor->ne[3];
+        const int64_t n_rows = tensor->ne[1];  // ne[3] == 1
+        std::vector<uint8_t> bits;
         std::vector<int32_t> boundaries;
-        if (is_pure_causal_mask(data, tensor->type, n_kv, n_rows, boundaries)) {
+        const rpc_mask_kind kind = scan_mask(data, tensor->type, n_kv, n_rows, bits, boundaries);
+        // Prefer FILL_CAUSAL_MASK (smaller payload) when the mask is a pure
+        // causal prefix and the boundaries fit the wire encoding (a truncated
+        // n_rows/boundary fails the worker's checks and tears down the
+        // connection instead of falling back to the data path).
+        const bool boundaries_ok = tensor->ne[0] <= INT32_MAX
+            && (int64_t) tensor->ne[1] * tensor->ne[3] <= (int64_t) UINT32_MAX;
+        if (kind == rpc_mask_kind::PURE_CAUSAL && boundaries_ok) {
             size_t payload_size = sizeof(rpc_tensor) + sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t) + (size_t) n_rows * sizeof(int32_t);
             // the shared_ptr must be the sole owner of this buffer (a
             // shared_ptr over a std::vector's data() would double-free it)
@@ -1080,28 +1090,11 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
             ctx->dispatcher->send(RPC_CMD_FILL_CAUSAL_MASK, input_ptr, payload_size, nullptr, 0, nullptr, 0);
             return;
         }
-        // not a pure causal prefix (SWA / empty cells / alibi / multi-stream) -
-        // fall through to the binary-mask path below
-    }
-    // Fast path 2: the mask is binary (every element is 0.0 or -inf) but not
-    // a simple causal prefix (e.g. prefix-share, SWA holes). Compress to 1 bit
-    // per element (1/16 the f16 traffic) and let the worker expand locally.
-    if (offset == 0
-        && size == (size_t) ggml_nbytes(tensor)
-        && size >= 1024 * 1024
-        && tensor->name[0] != '\0'
-        && strstr(tensor->name, "mask") != nullptr
-        && (tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_F32)
-        && tensor->ne[2] == 1
-        && tensor->ne[3] == 1
-        && tensor->nb[0] == (size_t) ggml_type_size(tensor->type)
-        && tensor->nb[1] == tensor->nb[0] * tensor->ne[0]
-        && tensor->nb[2] == tensor->nb[1] * tensor->ne[1]
-        && !rpc_mask_fill_disabled()
-        && rpc_proto_minor(ctx->endpoint) >= 2) {
-        const int64_t n_elements = (int64_t) tensor->ne[0] * tensor->ne[1];
-        std::vector<uint8_t> bits;
-        if (is_binary_mask(data, tensor->type, n_elements, bits)) {
+        // SET_MASK_BITS: any binary mask (proto >= 2). A pure-causal mask that
+        // is too large for the boundary encoding also lands here.
+        if ((kind == rpc_mask_kind::PURE_CAUSAL || kind == rpc_mask_kind::BINARY)
+            && rpc_proto_minor(ctx->endpoint) >= 2) {
+            const int64_t n_elements = (int64_t) tensor->ne[0] * tensor->ne[1];
             size_t payload_size = sizeof(rpc_tensor) + sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint64_t) + bits.size();
             uint8_t * payload = new uint8_t[payload_size]();
             memcpy(payload, &wire, sizeof(wire));

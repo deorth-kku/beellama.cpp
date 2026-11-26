@@ -351,9 +351,19 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
 llama_build_and_test(test-quantize-target.cpp  LABEL "main behavior backend"  LINK llama)
-# FILL_CAUSAL_MASK fast-path verification (header-only helper in ggml-rpc)
+# FILL_CAUSAL_MASK / SET_MASK_BITS fast-path verification (header-only helper
+# in ggml-rpc)
 llama_build_and_test(test-rpc-mask.cpp)
 target_include_directories(test-rpc-mask PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc)
+# exercise the AVX2 path in ggml-rpc-mask.h (guarded by __AVX2__)
+# GGML_SYSTEM_ARCH is only set in the ggml/src scope, not visible here
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|i686|AMD64|amd64)$")
+    if (CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
+        target_compile_options(test-rpc-mask PRIVATE /arch:AVX2)
+    else()
+        target_compile_options(test-rpc-mask PRIVATE -mavx2)
+    endif()
+endif()
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)

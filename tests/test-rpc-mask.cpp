@@ -137,6 +137,25 @@ int main() {
         assert(bits[0] == 0xF0);
     }
     {
+        // 16 elements exercises the SIMD loop: first 8 keep, last 8 drop
+        std::vector<uint16_t> data = { 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                                       0xFC00, 0xFC00, 0xFC00, 0xFC00, 0xFC00, 0xFC00, 0xFC00, 0xFC00 };
+        std::vector<uint8_t> bits;
+        assert(is_binary_mask(data.data(), GGML_TYPE_F16, 16, bits));
+        assert(bits.size() == 2);
+        assert(bits[0] == 0x00);
+        assert(bits[1] == 0xFF);
+    }
+    {
+        // 16 elements exercises the SIMD loop: alternating keep/drop
+        std::vector<uint16_t> data = { 0x0000, 0xFC00, 0x0000, 0xFC00, 0x0000, 0xFC00, 0x0000, 0xFC00,
+                                       0x0000, 0xFC00, 0x0000, 0xFC00, 0x0000, 0xFC00, 0x0000, 0xFC00 };
+        std::vector<uint8_t> bits;
+        assert(is_binary_mask(data.data(), GGML_TYPE_F16, 16, bits));
+        assert(bits[0] == 0xAA);
+        assert(bits[1] == 0xAA);
+    }
+    {
         // non-binary value (0x3C00 = +1.0) must be rejected
         std::vector<uint16_t> data = { 0x0000, 0x3C00, 0x0000, 0x0000, 0xFC00, 0xFC00, 0xFC00, 0xFC00 };
         std::vector<uint8_t> bits;
