@@ -246,7 +246,22 @@ inline bool is_pure_causal_mask(const void * data, ggml_type type, int64_t n_kv,
 // 0x0000 = keep (+0.0), 0xFC00 = drop (-inf).
 inline void expand_mask_bits_f16(const uint8_t * bits, uint16_t * out, int64_t n_elements) {
     int64_t i = 0;
-#if defined(__AVX2__)
+#if defined(__AVX512BW__)
+    // lane k of `shifts` holds k, so shifting the byte right by lane k
+    // leaves bit k of the byte in lane k
+    const __m256i shifts = _mm256_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    const __m256i one = _mm256_set1_epi16(1);
+    const __m256i drop = _mm256_set1_epi16((int16_t) 0xFC00);
+    for (; i + 16 <= n_elements; i += 16) {
+        // low byte covers elements i..i+7, high byte covers i+8..i+15
+        const uint16_t b = (uint16_t) (bits[i / 8] | (uint16_t (bits[i / 8 + 1]) << 8));
+        const __m256i v = _mm256_set1_epi16(b);
+        __m256i x = _mm256_srlv_epi16(v, shifts);  // lane k = b >> k
+        x = _mm256_and_si256(x, one);              // lane k = bit k of b
+        x = _mm256_mullo_epi16(x, drop);           // 0 -> 0x0000, 1 -> 0xFC00
+        _mm256_storeu_si256((__m256i *) (out + i), x);
+    }
+#elif defined(__AVX2__)
     const __m256i drop = _mm256_set1_epi16((int16_t) 0xFC00);
     for (; i + 16 <= n_elements; i += 16) {
         // low byte covers elements i..i+7, high byte covers i+8..i+15
@@ -271,7 +286,8 @@ inline void expand_mask_bits_f16(const uint8_t * bits, uint16_t * out, int64_t n
 // 0x00000000 = keep (+0.0), 0xFF800000 = drop (-inf).
 inline void expand_mask_bits_f32(const uint8_t * bits, uint32_t * out, int64_t n_elements) {
     int64_t i = 0;
-#if defined(__AVX2__)
+#if defined(__AVX512BW__)
+    // _mm256_srlv_epi32 is AVX-512BW, not AVX2
     const __m256i shifts = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
     const __m256i one = _mm256_set1_epi32(1);
     const __m256i drop = _mm256_set1_epi32(0xFF800000);

@@ -16,6 +16,18 @@ if (GGML_SYSTEM_ARCH STREQUAL "x86" AND GGML_AVX2)
     endif()
 endif()
 
+# AVX-512BW is not implied by the AVX2 flags above, so the faster mask-expand
+# path in ggml-rpc-mask.h (guarded by __AVX512BW__) needs its own flag. The
+# binary then requires a CPU with AVX-512BW. MSVC has no /arch:AVX512BW,
+# /arch:AVX512 defines __AVX2__ and __AVX512BW__ together.
+if (GGML_SYSTEM_ARCH STREQUAL "x86" AND GGML_AVX512_BW)
+    if (CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
+        target_compile_options(ggml-rpc PRIVATE /arch:AVX512)
+    else()
+        target_compile_options(ggml-rpc PRIVATE -mavx2 -mavx512bw)
+    endif()
+endif()
+
 if (WIN32)
     target_link_libraries(ggml-rpc PRIVATE ws2_32)
 endif()

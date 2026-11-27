@@ -160,6 +160,7 @@ option(GGML_AVX512           "ggml: enable AVX512F"          OFF)
 option(GGML_AVX512_VBMI      "ggml: enable AVX512-VBMI"      OFF)
 option(GGML_AVX512_VNNI      "ggml: enable AVX512-VNNI"      OFF)
 option(GGML_AVX512_BF16      "ggml: enable AVX512-BF16"      OFF)
+option(GGML_AVX512_BW        "ggml: enable AVX512-BW"        OFF)
 if (NOT MSVC)
     # in MSVC F16C and FMA is implied with AVX2/AVX512
     option(GGML_FMA          "ggml: enable FMA"              ${INS_ENB})
